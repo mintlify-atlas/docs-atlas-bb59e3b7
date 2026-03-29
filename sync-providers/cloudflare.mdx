@@ -1,0 +1,389 @@
+---
+title: Cloudflare Workers
+description: Sync LiveStore via Cloudflare Durable Objects using @livestore/sync-cf.
+---
+
+The `@livestore/sync-cf` package provides a sync provider backed by Cloudflare Durable Objects. Each store gets its own Durable Object instance, which manages push/pull operations and persists events in DO SQLite (or optionally Cloudflare D1). Three transport modes are available: WebSocket, HTTP, and Durable Object RPC.
+
+## Architecture
+
+```
+Client (LiveStore)
+       │  WebSocket / HTTP push & pull
+       ▼
+  Cloudflare Worker
+  (routes by storeId)
+       │
+       ▼
+  Durable Object (per storeId)
+       │  Read/Write
+       ▼
+  DO SQLite (default) or D1
+```
+
+**Worker** — routes sync requests to the correct Durable Object by `storeId` and handles auth validation.
+
+**Durable Object** — manages sync state, handles push/pull, maintains WebSocket connections.
+
+**Storage** — events are persisted in DO SQLite by default, or in a Cloudflare D1 database.
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/sync-cf
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/sync-cf
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/sync-cf
+    ```
+  </Tab>
+</Tabs>
+
+## Backend setup
+
+### 1. Define the Durable Object
+
+Use `makeDurableObject` to create the sync backend class. Export it from your worker file so Cloudflare can bind it.
+
+```typescript worker.ts
+import { makeDurableObject } from '@livestore/sync-cf/cf-worker'
+
+const hasUserId = (p: unknown): p is { userId: string } =>
+  typeof p === 'object' && p !== undefined && p !== null && 'userId' in p
+
+export class SyncBackendDO extends makeDurableObject({
+  onPush: async (message, { storeId, payload }) => {
+    console.log(`Push to store ${storeId}:`, message.batch)
+
+    // Custom business logic
+    if (hasUserId(payload) === true) {
+      await Promise.resolve()
+    }
+  },
+  onPull: async (_message, { storeId }) => {
+    console.log(`Pull from store ${storeId}`)
+  },
+  enabledTransports: new Set(['ws', 'http']), // Disable DO RPC
+  otel: {
+    baseUrl: 'https://otel.example.com',
+    serviceName: 'livestore-sync',
+  },
+}) {}
+```
+
+### 2. Create the Worker
+
+For simple setups, use `makeWorker` to create a complete Cloudflare Worker fetch handler:
+
+```typescript worker.ts
+import { makeWorker } from '@livestore/sync-cf/cf-worker'
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  validatePayload: (payload, { storeId }) => {
+    // Simple token-based guard at connection time
+    const hasAuthToken = typeof payload === 'object' && payload !== null && 'authToken' in payload
+    if (hasAuthToken === false) {
+      throw new Error('Missing auth token')
+    }
+    if ((payload as any).authToken !== 'insecure-token-change-me') {
+      throw new Error('Invalid auth token')
+    }
+    console.log(`Validated connection for store: ${storeId}`)
+  },
+  enableCORS: true,
+})
+```
+
+For production workers that share routing with other endpoints, use `handleSyncRequest` directly:
+
+```typescript worker.ts
+import type { CFWorker, CfTypes } from '@livestore/sync-cf/cf-worker'
+import { handleSyncRequest, matchSyncRequest } from '@livestore/sync-cf/cf-worker'
+
+import type { Env } from './env.ts'
+
+export default {
+  fetch: async (request: CfTypes.Request, env: Env, ctx: CfTypes.ExecutionContext) => {
+    const searchParams = matchSyncRequest(request)
+
+    if (searchParams !== undefined) {
+      return handleSyncRequest({
+        request,
+        searchParams,
+        env,
+        ctx,
+        syncBackendBinding: 'SYNC_BACKEND_DO',
+      })
+    }
+
+    // Custom routes, assets, etc.
+    return new Response('Not found', { status: 404 }) as unknown as CfTypes.Response
+  },
+} satisfies CFWorker<Env>
+```
+
+### 3. Define the environment type
+
+```typescript env.ts
+import type { CfTypes, SyncBackendRpcInterface } from '@livestore/sync-cf/cf-worker'
+
+export interface Env {
+  SYNC_BACKEND_DO: CfTypes.DurableObjectNamespace<SyncBackendRpcInterface>
+}
+```
+
+### 4. Configure wrangler.toml
+
+```toml wrangler.toml
+name = "livestore-sync"
+main = "./src/worker.ts"
+compatibility_date = "2025-05-07"
+compatibility_flags = [
+  "enable_request_signal", # Required for HTTP streaming
+]
+
+[[durable_objects.bindings]]
+name = "SYNC_BACKEND_DO"
+class_name = "SyncBackendDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncBackendDO"]
+```
+
+To use D1 instead of DO SQLite, add a D1 binding:
+
+```toml wrangler.toml
+[[d1_databases]]
+binding = "DB"
+database_name = "livestore-sync"
+database_id = "your-database-id"
+```
+
+Then pass `storage: { _tag: 'd1', binding: 'DB' }` to `makeDurableObject`.
+
+## Client setup
+
+### Transport modes
+
+Three transport protocols are available. WebSocket is recommended for most applications.
+
+<Tabs>
+  <Tab title="WebSocket (recommended)">
+    Real-time bidirectional communication with automatic reconnection.
+
+    ```typescript store.ts
+    import { makeWsSync } from '@livestore/sync-cf/client'
+
+    export const syncBackend = makeWsSync({
+      url: 'wss://sync.example.com',
+    })
+    ```
+
+    With options:
+
+    ```typescript store.ts
+    import { makeWsSync } from '@livestore/sync-cf/client'
+
+    export const syncBackend = makeWsSync({
+      url: 'wss://sync.example.com',
+      ping: {
+        enabled: true,
+        requestTimeout: 5000,
+        requestInterval: 15000,
+      },
+    })
+    ```
+  </Tab>
+  <Tab title="HTTP">
+    HTTP-based sync with polling. Requires the `enable_request_signal` compatibility flag.
+
+    ```typescript store.ts
+    import { makeHttpSync } from '@livestore/sync-cf/client'
+
+    export const syncBackend = makeHttpSync({
+      url: 'https://sync.example.com',
+      livePull: {
+        pollInterval: 3000, // Poll every 3 seconds
+      },
+    })
+    ```
+  </Tab>
+  <Tab title="Durable Object RPC">
+    Direct RPC communication between Durable Objects. Used internally by
+    `@livestore/adapter-cloudflare`.
+
+    ```typescript store.ts
+    import { makeDoRpcSync } from '@livestore/sync-cf/client'
+
+    export const syncBackend = makeDoRpcSync({
+      syncBackendStub: env.SYNC_BACKEND_DO.get(id),
+      durableObjectContext: {
+        bindingName: 'SYNC_BACKEND_DO',
+        durableObjectId: ctx.id,
+      },
+    })
+    ```
+  </Tab>
+</Tabs>
+
+### Wire the backend into your adapter
+
+```typescript worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+import { schema } from './schema.ts'
+
+makeWorker({
+  schema,
+  sync: {
+    backend: makeWsSync({
+      url: 'wss://sync.example.com',
+    }),
+  },
+})
+```
+
+## `onBackendIdMismatch` option
+
+When a sync backend is reset (for example, by deleting `.wrangler/state`), clients with cached local data detect the mismatch via a `backendId` comparison. Configure the behavior with `onBackendIdMismatch`:
+
+```typescript
+const store = await makeStore({
+  sync: {
+    backend: syncBackend,
+    onBackendIdMismatch: 'reset', // 'reset' | 'shutdown' | 'ignore'
+  },
+})
+```
+
+<ParamField path="onBackendIdMismatch" type="'reset' | 'shutdown' | 'ignore'" default="reset">
+  - **`reset`** — Clear local storage and shut down. The app restarts and syncs fresh data. Recommended for development.
+  - **`shutdown`** — Shut down without clearing local storage. Stale data persists on restart.
+  - **`ignore`** — Log the error and continue. The client shows stale data but keeps running.
+</ParamField>
+
+## Deploying to Cloudflare
+
+<Steps>
+  <Step title="Deploy the Worker">
+    ```bash
+    npx wrangler deploy
+    ```
+  </Step>
+  <Step title="Create a D1 database (optional)">
+    If you chose D1 storage instead of DO SQLite:
+
+    ```bash
+    npx wrangler d1 create livestore-sync
+    npx wrangler d1 migrations apply livestore-sync
+    ```
+  </Step>
+</Steps>
+
+## Local development
+
+```bash
+npx wrangler dev
+```
+
+When using D1, the local database is stored at `.wrangler/state/d1/miniflare-D1DatabaseObject/<id>.sqlite`.
+
+<Tip>
+  Delete `.wrangler/state` to reset the local sync backend. If your client has cached data, set `onBackendIdMismatch: 'reset'` to let it recover automatically.
+</Tip>
+
+## Authentication
+
+Use `validatePayload` to authenticate clients at connection time. The function receives the client-supplied `payload` and request headers.
+
+```typescript worker.ts
+import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+
+export class SyncBackendDO extends makeDurableObject({
+  onPush: async (message, { storeId }) => {
+    // Log all sync events
+    console.log(`Store ${storeId} received ${message.batch.length} events`)
+  },
+}) {}
+
+const hasStoreAccess = (_userId: string, _storeId: string): boolean => true
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  validatePayload: (payload, { storeId }) => {
+    if (!(typeof payload === 'object' && payload !== null && 'userId' in payload)) {
+      throw new Error('User ID required')
+    }
+
+    // Validate user has access to store
+    if (hasStoreAccess((payload as any).userId as string, storeId) === false) {
+      throw new Error('Unauthorized access to store')
+    }
+  },
+  enableCORS: true,
+})
+```
+
+<Note>
+  `validatePayload` runs only at connection time, not for individual push events. To validate push events, use the `onPush` callback in `makeDurableObject`.
+</Note>
+
+## Storage engines
+
+<AccordionGroup>
+  <Accordion title="DO SQLite (default)">
+    Events are stored in the Durable Object's own SQLite database. Table names follow the pattern `eventlog_{VERSION}_{storeId}`.
+
+    **Pros**: easiest to deploy (no D1 provisioning), data co-located with the DO, lowest latency.
+
+    **Cons**: not directly inspectable outside the DO; operational tooling must go through the DO.
+  </Accordion>
+  <Accordion title="D1 (optional)">
+    Pass `storage: { _tag: 'd1', binding: 'DB' }` to `makeDurableObject` and add a `[[d1_databases]]` binding to `wrangler.toml`.
+
+    **Pros**: inspectable via D1 tooling; enables cross-store analytics.
+
+    **Cons**: extra network hop; requires D1 provisioning.
+  </Accordion>
+</AccordionGroup>
+
+## Transport protocol details
+
+LiveStore identifies sync requests by search parameters alone — the request path does not matter. Use `matchSyncRequest` to detect sync traffic anywhere in your worker:
+
+```typescript
+import type { CfTypes } from '@livestore/sync-cf/cf-worker'
+import { matchSyncRequest } from '@livestore/sync-cf/cf-worker'
+
+declare const request: CfTypes.Request
+
+const searchParams = matchSyncRequest(request)
+if (searchParams !== undefined) {
+  const { storeId, payload, transport } = searchParams
+  console.log(`Sync request for store ${storeId} via ${transport}`)
+}
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `storeId` | `string` | Yes | Target LiveStore identifier |
+| `transport` | `'ws' \| 'http'` | Yes | Transport protocol selector |
+| `payload` | JSON (URI-encoded) | No | Arbitrary JSON for auth/tenant routing; validated in `validatePayload` |
+
+- WebSocket: `https://sync.example.com?storeId=abc&transport=ws` (must include `Upgrade: websocket`)
+- HTTP: `https://sync.example.com?storeId=abc&transport=http`
+
+<Warning>
+  For `transport=ws`, if the request does not include `Upgrade: websocket`, the backend returns `426 Upgrade Required`.
+</Warning>

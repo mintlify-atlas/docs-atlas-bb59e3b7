@@ -1,0 +1,228 @@
+---
+title: Solid integration
+description: Integrate LiveStore with SolidJS using reactive signals, a Suspense-based store hook, and fine-grained query subscriptions via @livestore/solid.
+---
+
+The `@livestore/solid` package provides SolidJS bindings for LiveStore. It integrates with Solid's fine-grained reactivity system, exposing `useStore()` and `store.useQuery()` that return Solid signals.
+
+## Installation
+
+```bash
+npm install @livestore/solid @livestore/livestore @livestore/adapter-web @livestore/wa-sqlite
+```
+
+## Setup
+
+<Steps>
+  <Step title="Create a worker file">
+    Create a dedicated worker file that registers your schema with the LiveStore web worker:
+
+    ```typescript livestore.worker.ts
+    import { makeWorker } from '@livestore/adapter-web/worker'
+    import { schema } from './schema.ts'
+
+    makeWorker({ schema })
+    ```
+  </Step>
+  <Step title="Configure the store">
+    Create a store configuration file and export a custom `useAppStore` hook:
+
+    ```typescript store.ts
+    import { makePersistedAdapter } from '@livestore/adapter-web'
+    import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+    import { useStore } from '@livestore/solid'
+    import LiveStoreWorker from './livestore.worker.ts?worker'
+    import { schema } from './schema.ts'
+
+    const adapter = makePersistedAdapter({
+      storage: { type: 'opfs' },
+      worker: LiveStoreWorker,
+      sharedWorker: LiveStoreSharedWorker,
+    })
+
+    export const useAppStore = () =>
+      useStore({
+        adapter,
+        schema,
+        storeId: 'default',
+      })
+    ```
+
+    `useStore()` returns an accessor (a Solid signal) that resolves to the store instance. Components calling it suspend until the store is ready.
+  </Step>
+</Steps>
+
+## Querying data
+
+Use `store.useQuery()` to subscribe to reactive queries. In Solid, the query result is wrapped in a signal, so you call it as a function inside JSX or `createEffect`.
+
+```tsx MainSection.tsx
+/** @jsxImportSource solid-js */
+import { type Component, For } from 'solid-js'
+import { queryDb } from '@livestore/livestore'
+import { useAppStore } from './livestore/store.ts'
+import { tables } from './livestore/schema.ts'
+
+const visibleTodos$ = queryDb(tables.todos.where({ completed: false }), { label: 'visibleTodos' })
+
+export const TodoList: Component = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(visibleTodos$)
+
+  return (
+    <ul>
+      <For each={todos()}>
+        {(todo) => <li>{todo.text}</li>}
+      </For>
+    </ul>
+  )
+}
+```
+
+<Note>
+Call `todos()` as a function inside JSX — this is how Solid signals work. LiveStore's reactivity integrates directly with Solid's fine-grained signal tracking.
+</Note>
+
+## Committing events
+
+Access the store via `useAppStore()` and call `store.commit()` to dispatch events. The store accessor must be called (as a function) to retrieve the store instance.
+
+```tsx TodoActions.tsx
+/** @jsxImportSource solid-js */
+import { type Component } from 'solid-js'
+import { useAppStore } from './livestore/store.ts'
+import { events } from './livestore/schema.ts'
+
+export const TodoActions: Component = () => {
+  const store = useAppStore()
+
+  const handleToggle = (id: string, completed: boolean) => {
+    const s = store()
+    if (s === undefined) return
+    s.commit(completed ? events.todoUncompleted({ id }) : events.todoCompleted({ id }))
+  }
+
+  const handleDelete = (id: string) => {
+    const s = store()
+    if (s === undefined) return
+    s.commit(events.todoDeleted({ id, deletedAt: new Date() }))
+  }
+
+  return (
+    <button type="button" onClick={() => handleToggle('1', false)}>
+      Toggle
+    </button>
+  )
+}
+```
+
+## Full component example
+
+This example shows querying, rendering, and committing events together — based on the solid TodoMVC example:
+
+```tsx MainSection.tsx
+/** @jsxImportSource solid-js */
+import { type Component, For } from 'solid-js'
+import { visibleTodos$ } from './livestore/queries.ts'
+import { events, type tables } from './livestore/schema.ts'
+import { useAppStore } from './livestore/store.ts'
+
+let currentStore: ReturnType<typeof useAppStore> | undefined
+
+const handleToggle = (event: Event & { currentTarget: HTMLInputElement }) => {
+  const store = currentStore?.()
+  if (store === undefined) return
+  const id = event.currentTarget.dataset.todoId
+  const completed = event.currentTarget.dataset.todoCompleted
+  if (id === undefined || completed === undefined) return
+  store.commit(completed === 'true' ? events.todoUncompleted({ id }) : events.todoCompleted({ id }))
+}
+
+const handleDelete = (event: MouseEvent & { currentTarget: HTMLButtonElement }) => {
+  const store = currentStore?.()
+  if (store === undefined) return
+  const id = event.currentTarget.dataset.todoId
+  if (id === undefined) return
+  store.commit(events.todoDeleted({ id, deletedAt: new Date() }))
+}
+
+export const MainSection: Component = () => {
+  const store = useAppStore()
+  currentStore = store
+  const todos = store.useQuery(visibleTodos$)
+  const todoItems = () => todos() ?? ([] as (typeof tables.todos.Type)[])
+
+  return (
+    <section class="main">
+      <ul class="todo-list">
+        <For each={todoItems()}>
+          {(todo: typeof tables.todos.Type) => (
+            <li>
+              <input
+                type="checkbox"
+                class="toggle"
+                checked={todo.completed}
+                data-todo-id={todo.id}
+                data-todo-completed={todo.completed === true ? 'true' : 'false'}
+                onChange={handleToggle}
+              />
+              <label>{todo.text}</label>
+              <button type="button" class="destroy" data-todo-id={todo.id} onClick={handleDelete} />
+            </li>
+          )}
+        </For>
+      </ul>
+    </section>
+  )
+}
+```
+
+## Logging
+
+Control the logger and log level via optional options in `useStore()`:
+
+```typescript store-logging.ts
+import { makePersistedAdapter } from '@livestore/adapter-web'
+import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+import { useStore } from '@livestore/solid'
+import { Logger, LogLevel } from '@livestore/utils/effect'
+import LiveStoreWorker from './livestore/livestore.worker.ts?worker'
+import { schema } from './livestore/schema.ts'
+
+const adapter = makePersistedAdapter({
+  storage: { type: 'opfs' },
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+})
+
+export const useAppStore = () =>
+  useStore({
+    schema,
+    adapter,
+    storeId: 'default',
+    logger: Logger.prettyWithThread('window'),
+    logLevel: LogLevel.Info, // use LogLevel.None to disable logs
+  })
+```
+
+## API reference
+
+### `useStore(options)`
+
+Returns a Solid accessor (signal) that resolves to the store instance. Suspends while loading.
+
+| Option | Type | Description |
+|---|---|---|
+| `storeId` | `string` | Unique identifier for the store instance |
+| `schema` | `Schema` | The LiveStore schema |
+| `adapter` | `Adapter` | The platform adapter |
+| `logger` | `Logger` | Optional custom logger |
+| `logLevel` | `LogLevel` | Optional minimum log level |
+
+### `store.useQuery(queryable)`
+
+Subscribes to a reactive query. Returns a Solid signal containing the query result. Call the signal as a function inside `createEffect`, JSX, or other reactive contexts.
+
+### `store.commit(...events)`
+
+Commits one or more events to the store. Call `store()` first to unwrap the signal, then call `.commit()` on the resolved store instance.

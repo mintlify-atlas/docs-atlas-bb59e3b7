@@ -1,0 +1,184 @@
+---
+title: When to use LiveStore
+description: An honest evaluation guide — when LiveStore is the right choice, when it isn't, and how it compares to Redux, TanStack Query, ElectricSQL, PouchDB, and other tools.
+---
+
+Choosing a data layer is a significant architectural decision. This page helps you evaluate whether LiveStore fits your project.
+
+## Evaluation exercise
+
+The fastest way to evaluate LiveStore for your app is to try modeling your **events**. Spend five minutes listing the things that can happen in your app as named events — if the model feels natural, LiveStore is likely a good fit.
+
+### Example: calendar app
+
+For a calendar/scheduling app, your events might be:
+
+- `AppointmentScheduled`
+- `AppointmentRescheduled`
+- `AppointmentCancelled`
+- `ParticipantInvitedToAppointment`
+- `ParticipantRespondedToInvite`
+
+From those events you could derive the following SQLite state:
+
+- `Appointment` table — `id`, `title`, `description`, `startTime`, `endTime`
+- `Participant` table — `id`, `name`, `email`
+- `InviteResponse` table — `appointmentId`, `participantId`, `status`
+
+If modeling your domain this way feels intuitive, LiveStore will work well for your project.
+
+---
+
+## When LiveStore is a great fit
+
+<CardGroup cols={2}>
+  <Card title="Productivity apps" icon="list-check">
+    Todo lists, note-taking tools, project managers, kanban boards — anywhere users create and manipulate structured data locally with optional sync.
+  </Card>
+  <Card title="Collaborative tools" icon="users">
+    Multi-player editing, shared workspaces, real-time co-editing. LiveStore's eventlog merges concurrent edits deterministically.
+  </Card>
+  <Card title="Offline-first apps" icon="wifi-slash">
+    Apps that must work without a network connection. LiveStore commits events locally and syncs when connectivity returns — no extra code required.
+  </Card>
+  <Card title="Complex local state" icon="database">
+    Apps that benefit from SQL joins, aggregations, and dynamic filters. LiveStore gives you the full power of SQLite against locally materialized data.
+  </Card>
+  <Card title="Cross-platform apps" icon="devices">
+    The same schema and event model works on web, mobile (Expo), desktop, Node.js, and server — one mental model across all platforms.
+  </Card>
+  <Card title="AI agents and tooling" icon="robot">
+    The immutable eventlog is ideal for agentic workflows: deterministic state reconstruction, time-travel debugging, and reproducible test scenarios.
+  </Card>
+</CardGroup>
+
+LiveStore is particularly well-suited to apps in the mold of Linear, Figma, or Notion — applications with rich local state, real-time collaboration, and offline support requirements.
+
+---
+
+## When LiveStore is NOT a good fit
+
+<CardGroup cols={2}>
+  <Card title="Existing server database" icon="server">
+    If your data must live in a Postgres or MySQL database that already exists, consider [ElectricSQL](https://electric-sql.com) or [Zero](https://zero.rocicorp.dev) — they sync from a server database to clients. LiveStore owns the eventlog as the source of truth.
+  </Card>
+  <Card title="Traditional client-server apps" icon="arrows-left-right">
+    If you're building a standard request/response app where the server is the source of truth and offline support is not needed, LiveStore adds complexity without benefit.
+  </Card>
+  <Card title="Unbounded data" icon="infinity">
+    All client app data must fit in an in-memory SQLite database. Databases up to ~1 GB are generally fine depending on device. If you have more data, you can segment across multiple stores (one per workspace/document), but unbounded growth is a bad fit.
+  </Card>
+  <Card title="Full-stack batteries-included" icon="battery-full">
+    If you need built-in auth, file storage, and a managed backend, tools like [Jazz](https://jazz.tools) or [Instant](https://instantdb.com) may be more appropriate.
+  </Card>
+  <Card title="Beginners" icon="graduation-cap">
+    LiveStore involves event sourcing, materializers, and a two-thread architecture. It makes most sense after you've experienced the problems it solves — state sync bugs, offline complexity, cache invalidation.
+  </Card>
+  <Card title="Minimal bundle size" icon="feather">
+    LiveStore adds several hundred kB to your app bundle (mostly SQLite). If minimizing bundle size is a hard requirement, this is a meaningful cost.
+  </Card>
+</CardGroup>
+
+---
+
+## Considerations
+
+### Database size
+
+All client app data should fit into an in-memory SQLite database. In practice, databases up to 1 GB work fine on modern devices. If your data exceeds this, segment it:
+
+- Use a separate `storeId` per project, workspace, or document
+- Each `storeId` gets its own isolated eventlog and SQLite database
+- Users load only the data for the workspace they have open
+
+### Sync concurrency
+
+LiveStore's sync system is designed for small to medium concurrency: 10s to low 100s of users collaborating on the same eventlog. For higher concurrency needs, use horizontal segmentation with multiple `storeId` values rather than one shared eventlog.
+
+### Source of truth
+
+In a LiveStore app, the **eventlog is the source of truth** — not a server database. The SQLite state on each client is a derived projection. If you need to integrate with an existing authoritative server database, LiveStore is not the right fit.
+
+---
+
+## Comparison with alternatives
+
+| | LiveStore | Redux / Zustand | TanStack Query | ElectricSQL / Zero | PouchDB / RxDB | Firebase / Supabase |
+|---|---|---|---|---|---|---|
+| Local state | SQLite (SQL) | In-memory JS | In-memory cache | SQLite (SQL) | Document store | Remote (cached) |
+| Persistence | Built-in | Manual | Manual | Built-in | Built-in | Server-side |
+| Sync | Built-in (event-based) | None | None | Built-in (row-based) | Built-in (doc-based) | Built-in (row-based) |
+| Offline | Yes | No | Partial | Yes | Yes | Partial |
+| Source of truth | Client eventlog | Client memory | Server | Server DB | Client | Server |
+| Conflict resolution | Rebase + custom logic | N/A | N/A | Postgres-based | CRDTs / custom | Last-write-wins |
+| Query model | Full SQL | Selector functions | HTTP endpoints | Full SQL | Map/reduce | NoSQL queries |
+| Event sourcing | Yes | Partial (actions) | No | No | No | No |
+
+### vs. Redux and Zustand
+
+Redux and Zustand manage in-memory state well, but offer no persistence or sync. You'd need to add IndexedDB for persistence, a sync layer for real-time updates, optimistic update logic, and an offline queue. LiveStore handles all of this in a single model.
+
+Redux is conceptually similar — actions map to events, reducers map to materializers. LiveStore goes further by leveraging SQLite for a much more flexible state model and adding persistence and sync out of the box.
+
+### vs. TanStack Query
+
+TanStack Query is a server-state caching library. It manages async fetching, caching, and invalidation. It does not provide offline support, sync, or a local database. LiveStore is a better fit when your primary data source should be local, not a remote API.
+
+### vs. ElectricSQL and Zero
+
+These are excellent if you have an existing Postgres database you want to sync to clients. LiveStore is a better fit when:
+
+- You are starting a new app without legacy data
+- You want event sourcing semantics (not just row-level sync)
+- You need the flexibility to materialize state in different ways from the same events
+
+### vs. PouchDB / RxDB
+
+These are document-oriented local-first databases with built-in sync. LiveStore differs in using a relational model (SQLite) and event sourcing. If your data is naturally document-shaped and you don't need SQL queries or event history, PouchDB/RxDB may be simpler.
+
+### vs. Firebase and Supabase
+
+These treat the server as the source of truth. Reads require network round-trips or complex client-side caching. Offline support is limited and requires extra work. LiveStore is client-first, works fully offline, and syncs via any backend you choose.
+
+---
+
+## Frequently asked questions
+
+<AccordionGroup>
+  <Accordion title="Can I use LiveStore with an existing database?">
+    Not directly. LiveStore owns the eventlog as the source of truth and derives all SQLite state from it. If you have an existing Postgres or MySQL database, consider [ElectricSQL](https://electric-sql.com) or [Zero](https://zero.rocicorp.dev) instead.
+  </Accordion>
+  <Accordion title="How much data can LiveStore handle?">
+    All client app data must fit in an in-memory SQLite database. Databases up to ~1 GB work on modern devices. For larger datasets, segment across multiple stores using different `storeId` values (one per workspace, project, or document). Each store loads only the data for the active context.
+  </Accordion>
+  <Accordion title="Does LiveStore work without a sync backend?">
+    Yes. You can run LiveStore with only an in-memory or locally-persisted store — no sync backend required. Add a sync provider later when you need multi-device or multi-user sync.
+  </Accordion>
+  <Accordion title="How many users can collaborate on the same store?">
+    LiveStore's sync is designed for small to medium concurrency: 10s to low 100s of users on the same eventlog. For higher concurrency, segment your data so each eventlog has a manageable number of concurrent writers.
+  </Accordion>
+  <Accordion title="What happens when two users edit the same data at the same time?">
+    LiveStore uses a rebase strategy: when concurrent events arrive, local pending events are replayed on top of remote events in global order. The default is last-write-wins at the materializer level. You can implement custom conflict resolution logic in your materializers for domain-specific merge behavior.
+  </Accordion>
+  <Accordion title="Is LiveStore suitable for beginners?">
+    LiveStore is a relatively advanced technology that involves event sourcing, a two-thread architecture, and materializers. It makes the most sense after you've experienced the problems it solves — cache invalidation bugs, offline complexity, state sync issues. If you're just getting started with web development, simpler tools may be a better first choice.
+  </Accordion>
+  <Accordion title="Can I migrate from an existing state management library?">
+    LiveStore does not provide tooling to import existing state into its eventlog. It is best adopted for new apps or new features where you control the data model from the start. Incremental migration is possible by running LiveStore alongside existing state management for specific parts of your app.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Still unsure?
+
+Try the evaluation exercise at the top of this page — model your app's events in five minutes. If the model feels natural and your data fits the constraints above, LiveStore is likely a good fit.
+
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Start with a practical overview and code example
+  </Card>
+  <Card title="How LiveStore works" icon="gears" href="/how-livestore-works">
+    Understand the architecture before committing
+  </Card>
+</CardGroup>

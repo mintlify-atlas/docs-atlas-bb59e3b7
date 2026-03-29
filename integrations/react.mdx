@@ -1,0 +1,424 @@
+---
+title: React integration
+description: Integrate LiveStore with React using hooks for reactive queries, client documents, sync status, and multi-store patterns.
+---
+
+The `@livestore/react` package provides first-class React bindings for LiveStore. It exposes a Suspense-based store hook, reactive query hooks, and a registry for managing multiple store instances.
+
+## Features
+
+- Fine-grained reactivity using LiveStore's signals-based system
+- Synchronous, instant query results — no `useEffect` or `isLoading` checks
+- Suspense-based loading with `ErrorBoundary` support
+- Multiple isolated store instances via `StoreRegistry`
+- Transactional state transitions via `batchUpdates`
+- Works with Expo / React Native via `@livestore/adapter-expo`
+
+## Installation
+
+```bash
+npm install @livestore/react @livestore/livestore
+```
+
+## Setup
+
+<Steps>
+  <Step title="Configure the store">
+    Create a store configuration file and export a custom hook wrapping `useStore()`. The hook suspends while the store is loading, so components that call it must be inside a `<Suspense>` boundary.
+
+    ```typescript store.ts
+    import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+    import { makeInMemoryAdapter } from '@livestore/adapter-web'
+    import { useStore } from '@livestore/react'
+    import { schema } from './schema.ts'
+
+    const adapter = makeInMemoryAdapter()
+
+    export const useAppStore = () =>
+      useStore({
+        storeId: 'app-root',
+        schema,
+        adapter,
+        batchUpdates,
+      })
+    ```
+  </Step>
+  <Step title="Set up the registry">
+    Create a `StoreRegistry` and provide it via `<StoreRegistryProvider>`. Wrap with `<Suspense>` and `<ErrorBoundary>` to handle loading and error states.
+
+    ```tsx App.tsx
+    import { type ReactNode, Suspense, useState } from 'react'
+    import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+    import { ErrorBoundary } from 'react-error-boundary'
+    import { StoreRegistry } from '@livestore/livestore'
+    import { StoreRegistryProvider } from '@livestore/react'
+
+    const appErrorFallback = <div>Something went wrong</div>
+    const appLoadingFallback = <div>Loading LiveStore...</div>
+
+    export const App = ({ children }: { children: ReactNode }) => {
+      const [storeRegistry] = useState(() => new StoreRegistry({ defaultOptions: { batchUpdates } }))
+
+      return (
+        <ErrorBoundary fallback={appErrorFallback}>
+          <Suspense fallback={appLoadingFallback}>
+            <StoreRegistryProvider storeRegistry={storeRegistry}>{children}</StoreRegistryProvider>
+          </Suspense>
+        </ErrorBoundary>
+      )
+    }
+    ```
+  </Step>
+  <Step title="Use the store in components">
+    Components access the store through your custom hook and commit events directly.
+
+    ```tsx MyComponent.tsx
+    import { useEffect } from 'react'
+    import { events } from './schema.ts'
+    import { useAppStore } from './store.ts'
+
+    export const MyComponent = () => {
+      const store = useAppStore()
+
+      useEffect(() => {
+        store.commit(events.todoCreated({ id: '1', text: 'Hello, world!', createdAt: new Date() }))
+      }, [store])
+
+      return <div>...</div>
+    }
+    ```
+  </Step>
+</Steps>
+
+## Querying data
+
+Use `store.useQuery()` to subscribe to reactive queries. The component re-renders automatically when the query result changes.
+
+```tsx CompletedTodos.tsx
+import type { FC } from 'react'
+import { queryDb } from '@livestore/livestore'
+import { tables } from './schema.ts'
+import { useAppStore } from './store.ts'
+
+const query$ = queryDb(tables.todos.where({ completed: true }).orderBy('id', 'desc'), {
+  label: 'completedTodos',
+})
+
+export const CompletedTodos: FC = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(query$)
+
+  return (
+    <div>
+      {todos.map((todo) => (
+        <div key={todo.id}>{todo.text}</div>
+      ))}
+    </div>
+  )
+}
+```
+
+`store.useQuery()` accepts any `Queryable`: a `QueryBuilder`, `LiveQueryDef`, `SignalDef`, or `LiveQuery` instance.
+
+## Client documents
+
+Use `store.useClientDocument()` for client-only state that is not synced. It works like `React.useState` but is backed by a `State.SQLite.clientDocument()` table.
+
+```tsx TodoItem.tsx
+import { type FC, useCallback } from 'react'
+import { tables } from './schema.ts'
+import { useAppStore } from './store.ts'
+
+export const TodoItem: FC<{ id: string }> = ({ id }) => {
+  const store = useAppStore()
+  const [todo, updateTodo] = store.useClientDocument(tables.uiState, id)
+
+  const handleClick = useCallback(() => {
+    updateTodo({ newTodoText: 'Hello, world!' })
+  }, [updateTodo])
+
+  return (
+    <button type="button" onClick={handleClick}>
+      {todo.newTodoText}
+    </button>
+  )
+}
+```
+
+`store.useClientDocument()` returns a `[row, setRow, id, query$]` tuple. The `id` argument is optional when the table has a default id.
+
+## Sync status
+
+Use `store.useSyncStatus()` to subscribe to real-time sync connection status.
+
+```tsx SyncIndicator.tsx
+import { useAppStore } from './store.ts'
+
+function SyncIndicator() {
+  const store = useAppStore()
+  const status = store.useSyncStatus()
+
+  return (
+    <span>
+      {status.isSynced ? 'Synced' : `Syncing (${status.pendingCount} pending)...`}
+    </span>
+  )
+}
+```
+
+## Multiple stores
+
+Use the `storeOptions()` helper to define reusable, type-safe store configurations, then create multiple instances with different `storeId` values.
+
+```typescript issue.store.ts
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { storeOptions } from '@livestore/livestore'
+import { schema } from './issue.schema.ts'
+
+// Define reusable store configuration with storeOptions()
+export const issueStoreOptions = (issueId: string) =>
+  storeOptions({
+    storeId: `issue-${issueId}`,
+    schema,
+    adapter: makeInMemoryAdapter(),
+  })
+```
+
+```tsx IssueView.tsx
+import { Suspense } from 'react'
+import { ErrorBoundary } from 'react-error-boundary'
+import { queryDb } from '@livestore/livestore'
+import { useStore } from '@livestore/react'
+import { tables } from './issue.schema.ts'
+import { issueStoreOptions } from './issue.store.ts'
+
+export const IssueView = ({ issueId }: { issueId: string }) => {
+  // useStore() suspends until the store is loaded; returns immediately if already cached
+  const issueStore = useStore(issueStoreOptions(issueId))
+  const [issue] = issueStore.useQuery(queryDb(tables.issue.select().where({ id: issueId })))
+
+  if (issue == null) return <div>Issue not found</div>
+
+  return (
+    <div>
+      <h3>{issue.title}</h3>
+      <p>Status: {issue.status}</p>
+    </div>
+  )
+}
+
+export const IssueViewWithSuspense = ({ issueId }: { issueId: string }) => (
+  <ErrorBoundary fallback={<div>Error loading issue</div>}>
+    <Suspense fallback={<div>Loading issue...</div>}>
+      <IssueView issueId={issueId} />
+    </Suspense>
+  </ErrorBoundary>
+)
+```
+
+Each store instance is completely isolated with its own data, event log, and synchronization state.
+
+### Preloading stores
+
+When you know a store will be needed soon, preload it to warm up the cache before the user navigates.
+
+```tsx PreloadedIssue.tsx
+import { Suspense, useCallback, useState } from 'react'
+import { ErrorBoundary } from 'react-error-boundary'
+import { useStoreRegistry } from '@livestore/react'
+import { issueStoreOptions } from './issue.store.ts'
+import { IssueView } from './IssueView.tsx'
+
+export const PreloadedIssue = ({ issueId }: { issueId: string }) => {
+  const [showIssue, setShowIssue] = useState(false)
+  const storeRegistry = useStoreRegistry()
+
+  // Preload the store when the user hovers (before they click)
+  const handleMouseEnter = useCallback(() => {
+    storeRegistry.preload({
+      ...issueStoreOptions(issueId),
+      unusedCacheTime: 10_000,
+    })
+  }, [issueId, storeRegistry])
+
+  return (
+    <div>
+      {!showIssue ? (
+        <button type="button" onMouseEnter={handleMouseEnter} onClick={() => setShowIssue(true)}>
+          Show Issue
+        </button>
+      ) : (
+        <ErrorBoundary fallback={<div>Error loading issue</div>}>
+          <Suspense fallback={<div>Loading issue...</div>}>
+            <IssueView issueId={issueId} />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </div>
+  )
+}
+```
+
+## Logging
+
+Customize the logger and log level for debugging:
+
+```typescript store-with-logging.ts
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { useStore } from '@livestore/react'
+import { Logger, LogLevel } from '@livestore/utils/effect'
+import { schema } from './schema.ts'
+
+const adapter = makeInMemoryAdapter()
+
+export const useAppStore = () =>
+  useStore({
+    storeId: 'app-root',
+    schema,
+    adapter,
+    batchUpdates,
+    logger: Logger.prettyWithThread('app'),
+    logLevel: LogLevel.Info,
+  })
+```
+
+Use `LogLevel.None` to disable logging entirely.
+
+## Framework compatibility
+
+<AccordionGroup>
+  <Accordion title="Vite">
+    LiveStore works with Vite out of the box.
+  </Accordion>
+  <Accordion title="TanStack Start">
+    Place `<StoreRegistryProvider>` in the `component` prop of `createRootRoute`, not inside `shellComponent`. The `shellComponent` can re-render on navigation, which would remount LiveStore and show the loading screen on every page transition.
+
+    ```tsx app/routes/__root.tsx
+    import { Outlet, HeadContent, Scripts, createRootRoute } from '@tanstack/react-router'
+    import { StoreRegistry } from '@livestore/livestore'
+    import { StoreRegistryProvider } from '@livestore/react'
+    import { Suspense, useState } from 'react'
+
+    export const Route = createRootRoute({
+      shellComponent: RootShell,   // HTML structure only — no providers here
+      component: RootComponent,    // App shell — StoreRegistryProvider goes here
+    })
+
+    function RootShell({ children }: { children: React.ReactNode }) {
+      return (
+        <html lang="en">
+          <head><HeadContent /></head>
+          <body>{children}<Scripts /></body>
+        </html>
+      )
+    }
+
+    function RootComponent() {
+      const [storeRegistry] = useState(() => new StoreRegistry())
+      return (
+        <Suspense fallback={<div>Loading LiveStore...</div>}>
+          <StoreRegistryProvider storeRegistry={storeRegistry}>
+            <Outlet />
+          </StoreRegistryProvider>
+        </Suspense>
+      )
+    }
+    ```
+  </Accordion>
+  <Accordion title="Expo / React Native">
+    LiveStore supports Expo and React Native via `@livestore/adapter-expo`. See the [platform adapters](/integrations/platform-adapters#expo) page for setup details.
+  </Accordion>
+  <Accordion title="Next.js">
+    Next.js is not yet supported out of the box due to its SSR constraints.
+  </Accordion>
+</AccordionGroup>
+
+## API reference
+
+### `storeOptions(options)`
+
+Helper for defining reusable store configurations with full type inference. Returns options that can be passed to `useStore()` or `storeRegistry.preload()`.
+
+| Option | Type | Description |
+|---|---|---|
+| `storeId` | `string` | Unique identifier for this store instance |
+| `schema` | `Schema` | The LiveStore schema |
+| `adapter` | `Adapter` | The platform adapter |
+| `unusedCacheTime` | `number` | Time in ms to keep unused stores in cache (default: `60_000` in browser, `Infinity` otherwise) |
+| `batchUpdates` | `function` | Function for batching React updates (recommended) |
+| `boot` | `function` | Called when the store is loaded |
+| `onBootStatus` | `function` | Callback for boot status updates |
+| `context` | `object` | User-defined context for dependency injection |
+| `syncPayload` | `object` | Payload sent to sync backend (e.g., auth tokens) |
+| `logger` | `Logger` | Custom logger implementation |
+| `logLevel` | `LogLevel` | Minimum log level |
+| `disableDevtools` | `boolean \| 'auto'` | Whether to disable devtools (default: `'auto'`) |
+
+### `useStore(options)`
+
+Returns a store instance augmented with React hooks (`store.useQuery()`, `store.useClientDocument()`, `store.useSyncStatus()`).
+
+- Suspends until the store is loaded.
+- Throws if loading fails (caught by `ErrorBoundary`).
+- Stores are cached by `storeId` in the `StoreRegistry`. Multiple calls with the same `storeId` return the same instance.
+- Store options are applied only on first load; changing options on a cached store has no effect.
+
+### `store.commit(...events)`
+
+Commits one or more events to the store.
+
+```typescript
+// Commit a single event
+store.commit(events.todoCreated({ id: '1', text: 'Buy milk', createdAt: new Date() }))
+
+// Commit multiple events
+store.commit(
+  events.todoCreated({ id: '1', text: 'Buy milk', createdAt: new Date() }),
+  events.todoCompleted({ id: '1' }),
+)
+
+// Commit via a transaction function
+store.commit((txn) => {
+  txn.commit(events.todoCreated({ id: '1', text: 'Buy milk', createdAt: new Date() }))
+})
+```
+
+### `store.useQuery(queryable)`
+
+Subscribes to a reactive query. Re-renders the component when the result changes. Accepts any `Queryable`: `QueryBuilder`, `LiveQueryDef`, `SignalDef`, or `LiveQuery` instance.
+
+### `store.useClientDocument(table, id?, options?)`
+
+`React.useState`-like hook for `State.SQLite.clientDocument()` tables. Returns a `[row, setRow, id, query$]` tuple.
+
+### `store.useSyncStatus()`
+
+Subscribes to sync status changes. Re-renders when the status changes.
+
+### `new StoreRegistry(config?)`
+
+Creates a registry that manages store loading, caching, and disposal.
+
+| Config option | Description |
+|---|---|
+| `defaultOptions.batchUpdates` | Default batching function for all stores |
+| `defaultOptions.unusedCacheTime` | Default cache retention time |
+| `defaultOptions.disableDevtools` | Whether to disable devtools by default |
+| `runtime` | Effect runtime for registry operations |
+
+### `<StoreRegistryProvider>`
+
+Context provider that makes a `StoreRegistry` available to descendant components via `useStoreRegistry()`.
+
+| Prop | Description |
+|---|---|
+| `storeRegistry` | The registry instance |
+
+### `useStoreRegistry(override?)`
+
+Returns the `StoreRegistry` from the nearest `<StoreRegistryProvider>`, or the `override` if provided.
+
+### `storeRegistry.preload(options)`
+
+Loads a store without suspending to warm up the cache. Returns a `Promise` that resolves when loading completes.

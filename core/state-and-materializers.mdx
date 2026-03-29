@@ -1,0 +1,348 @@
+---
+title: 'State and materializers'
+description: 'Define SQLite tables for your read model and write materializers that project events into state.'
+---
+
+In LiveStore, **state is always derived from the event log**. You never write to the database directly. Instead, you define:
+
+1. **SQLite tables** — the shape of your read model
+2. **Materializers** — functions that handle each event and write to those tables
+
+When the event log replays (on startup, after a rebase, or during a migration), materializers re-apply every event to reconstruct state from scratch.
+
+## Defining SQLite tables
+
+Use `State.SQLite.table()` to declare a table with explicit column types:
+
+```typescript schema.ts
+import { State } from '@livestore/livestore'
+
+export const userTable = State.SQLite.table({
+  name: 'users',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    email: State.SQLite.text(),
+    name: State.SQLite.text(),
+    age: State.SQLite.integer({ default: 0 }),
+    isActive: State.SQLite.boolean({ default: true }),
+    metadata: State.SQLite.json({ nullable: true }),
+  },
+  indexes: [{ name: 'idx_users_email', columns: ['email'], isUnique: true }],
+})
+```
+
+### Column types
+
+<AccordionGroup>
+  <Accordion title="Core SQLite column types">
+    | Column type | SQLite type | TypeScript type |
+    |---|---|---|
+    | `State.SQLite.text()` | `TEXT` | `string` |
+    | `State.SQLite.integer()` | `INTEGER` | `number` |
+    | `State.SQLite.real()` | `REAL` | `number` |
+    | `State.SQLite.blob()` | `BLOB` | `Uint8Array` |
+  </Accordion>
+  <Accordion title="Higher-level column types">
+    | Column type | SQLite type | TypeScript type |
+    |---|---|---|
+    | `State.SQLite.boolean()` | `INTEGER` (0/1) | `boolean` |
+    | `State.SQLite.json()` | `TEXT` (JSON string) | decoded JSON value |
+    | `State.SQLite.datetime()` | `TEXT` (ISO 8601) | `Date` |
+    | `State.SQLite.datetimeInteger()` | `INTEGER` (ms since epoch) | `Date` |
+  </Accordion>
+</AccordionGroup>
+
+### Column options
+
+All column types accept options:
+
+| Option | Type | Description |
+|---|---|---|
+| `primaryKey` | `boolean` | Mark as primary key |
+| `nullable` | `boolean` | Allow `NULL` values |
+| `default` | value | Default value when not provided |
+| `schema` | Effect Schema | Custom encode/decode schema |
+
+### Custom column schemas
+
+For columns that need custom serialization, pass a `schema` option:
+
+```typescript
+import { Schema, State } from '@livestore/livestore'
+
+export const UserMetadata = Schema.Struct({
+  petName: Schema.String,
+  favoriteColor: Schema.Literal('red', 'blue', 'green'),
+})
+
+export const userTable = State.SQLite.table({
+  name: 'user',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    name: State.SQLite.text(),
+    metadata: State.SQLite.json({ schema: UserMetadata }),
+  },
+})
+```
+
+### Effect Schema-based tables
+
+Alternatively, define tables using Effect Schema with annotations. This approach is useful when you already have Effect Schema definitions to reuse, or when you prefer composable schema types.
+
+```typescript
+import { Schema } from 'effect'
+import { State } from '@livestore/livestore'
+
+const TodoSchema = Schema.Struct({
+  id: Schema.String.pipe(State.SQLite.withPrimaryKey()),
+  text: Schema.String,
+  completed: Schema.Boolean.pipe(Schema.withConstructorDefault(() => false)),
+})
+
+export const todosTable = State.SQLite.tableFromSchema(TodoSchema)
+```
+
+Effect Schema types are mapped to SQLite automatically:
+
+| Schema type | SQLite type | TypeScript type |
+|---|---|---|
+| `Schema.String` | `text` | `string` |
+| `Schema.Number` | `real` | `number` |
+| `Schema.Int` | `integer` | `number` |
+| `Schema.Boolean` | `integer` | `boolean` |
+| `Schema.Date` | `text` | `Date` |
+| Complex types (Struct, Array) | `text` (JSON) | decoded type |
+| `Schema.optional(T)` | nullable column | `T \| undefined` |
+| `Schema.NullOr(T)` | nullable column | `T \| null` |
+
+<Note>
+  The Effect Schema-based approach will become the default once Effect Schema v4 is released.
+</Note>
+
+## Materializers
+
+Materializers are event handler functions that write to your SQLite tables. They run in order for every event in the event log.
+
+### Basic example
+
+```typescript schema.ts
+import { defineMaterializer, Events, Schema, State } from '@livestore/livestore'
+
+export const todos = State.SQLite.table({
+  name: 'todos',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    text: State.SQLite.text(),
+    completed: State.SQLite.boolean({ default: false }),
+  },
+})
+
+export const events = {
+  todoCreated: Events.synced({
+    name: 'todoCreated',
+    schema: Schema.Struct({
+      id: Schema.String,
+      text: Schema.String,
+      completed: Schema.Boolean.pipe(Schema.optional),
+    }),
+  }),
+  factoryResetApplied: Events.synced({
+    name: 'factoryResetApplied',
+    schema: Schema.Struct({}),
+  }),
+} as const
+
+export const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ id, text, completed }) =>
+    todos.insert({ id, text, completed: completed ?? false }),
+  ),
+  [events.factoryResetApplied.name]: defineMaterializer(events.factoryResetApplied, () => [
+    todos.update({ completed: false }),
+    { sql: 'DELETE FROM todos', bindValues: {} },
+  ]),
+})
+```
+
+### What a materializer can return
+
+| Return value | Description |
+|---|---|
+| Single write operation | e.g. `table.insert(...)` |
+| Array of write operations | Apply multiple writes in the same transaction |
+| `void` | No database changes needed |
+| `Effect` resolving to the above | For async materializer patterns |
+
+### Reading from the database inside a materializer
+
+Use `ctx.query` to read current state while handling an event:
+
+```typescript
+import { defineMaterializer, Events, Schema, State } from '@livestore/livestore'
+import { todos } from './example.ts'
+
+const events = {
+  todoCreated: Events.synced({
+    name: 'todoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+} as const
+
+export const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ id, text }, ctx) => {
+    const previousIds = ctx.query(todos.select('id'))
+    // ctx.query also supports raw SQL
+    const existingTodos = ctx.query({ query: 'SELECT id FROM todos', bindValues: {} })
+    return todos.insert({ id: `${existingTodos.length}-${id}`, text, completed: false, previousIds })
+  }),
+})
+```
+
+<Note>
+  Every materializer runs inside a transaction. Both `ctx.query` reads and returned write operations are part of that transaction, giving you a consistent view.
+</Note>
+
+### Keep materializers deterministic
+
+Materializers must be **side-effect free and deterministic**. Since they can be re-run during replays or rebases, any non-determinism leads to diverging state across clients.
+
+<CodeGroup>
+
+```typescript non-deterministic (avoid)
+import { randomUUID } from 'node:crypto'
+import { defineMaterializer, Events, Schema, State } from '@livestore/livestore'
+
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ text: Schema.String }),
+  }),
+} as const
+
+// BAD: randomUUID() produces different values on each replay
+const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ text }) =>
+    todos.insert({ id: randomUUID(), text }),
+  ),
+})
+```
+
+```typescript deterministic (recommended)
+import { defineMaterializer, Events, nanoid, Schema, State } from '@livestore/livestore'
+
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    // ID is part of the event payload
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+} as const
+
+// GOOD: ID comes from the event, same result every replay
+const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ id, text }) =>
+    todos.insert({ id, text }),
+  ),
+})
+
+// Generate the ID at commit time, not in the materializer
+store.commit(events.todoCreated({ id: nanoid(), text: 'Buy groceries' }))
+```
+
+</CodeGroup>
+
+## SQL queries
+
+### Query builder
+
+LiveStore provides a query builder for common operations. Query results are typed automatically from the table definition.
+
+```typescript
+import { Schema } from 'effect'
+import { State } from '@livestore/livestore'
+
+const table = State.SQLite.table({
+  name: 'my_table',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    name: State.SQLite.text(),
+    tags: State.SQLite.json({ schema: Schema.Array(Schema.String), default: [] }),
+  },
+})
+
+// Read queries
+table.select('name')
+table.where('name', '=', 'Alice')
+table.where({ name: 'Alice' })
+table.orderBy('name', 'desc').offset(10).limit(10)
+table.count().where('name', 'LIKE', '%Ali%')
+
+// Write queries (used in materializers)
+table.insert({ id: '123', name: 'Bob' })
+table.update({ name: 'Alice' }).where({ id: '123' })
+table.delete().where({ id: '123' })
+
+// Upsert
+table.insert({ id: '123', name: 'Charlie' }).onConflict('id', 'replace')
+```
+
+### Raw SQL
+
+For complex queries, use the `sql` tag with an explicit result schema:
+
+```typescript
+import { queryDb, Schema, State, sql } from '@livestore/livestore'
+
+const table = State.SQLite.table({
+  name: 'my_table',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    name: State.SQLite.text(),
+  },
+})
+
+const filtered$ = queryDb({
+  query: sql`select * from my_table where name = 'Alice'`,
+  schema: Schema.Array(table.rowSchema),
+})
+
+const count$ = queryDb({
+  query: sql`select count(*) as count from my_table`,
+  schema: Schema.Struct({ count: Schema.Number }).pipe(Schema.pluck('count'), Schema.Array, Schema.headOrElse()),
+})
+```
+
+## Schema migrations
+
+When you change your table definitions, LiveStore can migrate the read model automatically.
+
+| Strategy | Description |
+|---|---|
+| `auto` | Automatically migrates the database to the new schema and rematerializes state from the event log |
+| `manual` | You handle the migration yourself |
+
+<Tip>
+  Because state is derived from the event log, migrations that use `auto` are safe — the full history is replayed through the updated materializers to reconstruct consistent state.
+</Tip>
+
+## Client documents
+
+Client documents are a convenience wrapper for local-only state with an API similar to `React.useState()`. They automatically create a table with `id` and `value` columns, along with a matching `Set` event and materializer.
+
+```typescript
+import { Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+export const tables = {
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({
+      newTodoText: Schema.String,
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+    default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+  }),
+}
+```
+
+<Warning>
+  When a client document's schema changes in a non-backward-compatible way, previous events are dropped and state resets. Do not store data in client documents that must not be lost.
+</Warning>

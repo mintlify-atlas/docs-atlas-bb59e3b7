@@ -1,0 +1,322 @@
+---
+title: Production checklist
+description: A comprehensive guide to preparing a LiveStore application for production — schema review, sync backend deployment, error handling, performance, testing, monitoring, and security.
+---
+
+This guide walks through everything you should review before shipping a LiveStore application to production. Work through each section and confirm you have addressed the relevant items for your app.
+
+<Note>
+Not every item applies to every app. Use this as a reference, not a strict gate.
+</Note>
+
+## Schema review
+
+### Event versioning
+
+- All event names include a version prefix (`v1.`, `v2.`, ...). Without version prefixes you cannot safely introduce a new version of an event later.
+- You have not changed the shape of an existing event without bumping the version. Changing a field name or type on an existing event breaks replay for clients with the old event in their log.
+
+### Backward compatibility
+
+- New optional fields in events have defaults, so old clients that replayed events before the field existed still produce correct state.
+- Materializers handle both old and new event versions. If you have `v1.TodoCreated` and `v2.TodoCreated`, both must have materializers.
+- You have configured `unknownEventHandling` to the appropriate strategy for your rollout:
+
+```typescript
+import { makeSchema } from '@livestore/livestore'
+
+const schema = makeSchema({
+  events,
+  state,
+  unknownEventHandling: {
+    strategy: 'callback',
+    onUnknownEvent: (event, error) => {
+      // Forward to your error monitoring service
+      console.warn('Unknown event encountered', { event, reason: error.reason })
+    },
+  },
+})
+```
+
+| Strategy | Use case |
+|----------|----------|
+| `'warn'` | Default — logs and continues. Good for gradual rollouts. |
+| `'ignore'` | Silently skip unknown events from newer clients. |
+| `'fail'` | Stop immediately. Use during development only. |
+| `'callback'` | Log to telemetry and continue. Recommended for production. |
+
+### State table review
+
+- All SQLite tables have appropriate indexes for the queries your app runs. Missing indexes cause full table scans.
+- Soft deletes are used instead of hard deletes wherever you might need to restore or audit deleted records.
+- JSON columns have explicit schemas where possible so type errors surface at commit time rather than at query time.
+
+## Sync backend
+
+### Deployment
+
+- The sync backend is deployed to a region close to your users. LiveStore uses a push/pull model; higher latency increases the time between a commit and other clients seeing it.
+- The sync backend is configured with appropriate memory and CPU limits. Each connected client holds a WebSocket connection.
+- You have load-tested the sync backend with the expected number of concurrent connections before launching.
+
+### Authentication is enforced
+
+- `validatePayload` in your Worker validates auth tokens and rejects unauthenticated connections.
+- Authorization is enforced inside the Durable Object's `onPush` as well, not only at the Worker level.
+- Auth tokens have expiry and your client refreshes them before they expire.
+
+See the [Auth and encryption guide](/guides/auth-and-encryption) for implementation details.
+
+### Monitoring the sync backend
+
+- Sync backend logs are being collected and forwarded to a log aggregation service.
+- You have alerts on error rates, connection counts, and push/pull latency.
+- OpenTelemetry tracing is configured to capture sync operation traces (see [Monitoring](#monitoring) below).
+
+## Error handling
+
+### `unknownEventHandling`
+
+Configure this before launch. The default `'warn'` strategy is suitable for development but you should choose explicitly for production:
+
+```typescript
+// Recommended for production: forward to telemetry, keep running
+unknownEventHandling: {
+  strategy: 'callback',
+  onUnknownEvent: (event, error) => {
+    myMonitoringService.captureException(new Error('Unknown LiveStore event'), {
+      extra: { event, reason: error.reason },
+    })
+  },
+}
+```
+
+### Materializer errors
+
+Materializer errors prevent state from being updated for the affected event. Test materializers with edge-case inputs (null fields, max-length strings, unexpected types) before shipping.
+
+### Sync connection errors
+
+LiveStore automatically retries sync connections on failure. Verify that your client handles long disconnects gracefully by testing with the DevTools sync latch closed for extended periods.
+
+## Performance
+
+### SQLite adapter choice
+
+<Tabs>
+  <Tab title="Persisted (recommended for production)">
+    Uses the device's native SQLite, persists data between sessions, and supports larger datasets. This is the default for production use.
+
+    ```typescript
+    import { makeAdapter } from '@livestore/adapter-web'
+
+    const adapter = makeAdapter({ storage: { type: 'opfs' } })
+    ```
+  </Tab>
+  <Tab title="In-memory">
+    Stores everything in memory. No persistence across page reloads. Use for testing, demos, or sessions where persistence is not needed.
+
+    ```typescript
+    import { makeInMemoryAdapter } from '@livestore/adapter-web'
+
+    const adapter = makeInMemoryAdapter()
+    ```
+  </Tab>
+</Tabs>
+
+### Query optimization
+
+- Every reactive query (`queryDb`) that runs frequently is using an indexed column in its `WHERE` clause.
+- Queries do not return more columns than the component needs. Fetching unnecessary columns wastes deserialization time.
+- Computed signals that depend on many rows are reviewed for unnecessary breadth. A signal that depends on an entire table re-runs whenever any row in that table changes.
+- You have used the **Query inspector** in DevTools to identify queries that run more often than expected.
+
+### Event log size
+
+- High-frequency events (cursor positions, real-time presence) are in a separate container from low-frequency domain events. This prevents the domain event log from growing unboundedly.
+- Consider whether your app needs event log compaction for long-lived stores.
+
+## Testing
+
+### Unit testing with the event log
+
+Because LiveStore state is fully deterministic from the event log, unit tests are straightforward: commit a sequence of events and assert the resulting state.
+
+```typescript
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { makeStore } from '@livestore/livestore'
+import { schema, events, tables } from './schema.ts'
+
+test('todo created event inserts a row', async () => {
+  const adapter = makeInMemoryAdapter()
+  const store = await makeStore({ schema, adapter, storeId: 'test' })
+
+  store.commit(events.todoCreated({ id: 'todo-1', text: 'Buy groceries' }))
+
+  const todos = store.query(tables.todos.select())
+  expect(todos).toHaveLength(1)
+  expect(todos[0].text).toBe('Buy groceries')
+})
+```
+
+### Materializer tests
+
+Test each materializer with representative events, including edge cases:
+
+- Events with optional fields omitted
+- Events that update existing rows (upsert behavior)
+- Events that affect multiple tables
+
+### Schema evolution tests
+
+If you are deploying a new event version alongside an old one, write tests that replay a mix of `v1.*` and `v2.*` events and assert correct final state. This catches materializer coverage gaps before they reach production.
+
+### Offline and sync tests
+
+- Test that events committed while the sync latch is closed queue correctly and sync when reopened.
+- Test that two clients with diverging local histories merge correctly when reconnected.
+
+## Monitoring
+
+### OpenTelemetry
+
+LiveStore emits OpenTelemetry traces for store operations, event commits, materializer runs, and sync. Configure a tracer and wire it in both the worker and the store:
+
+```typescript
+// otel.ts — configure a tracer
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
+import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web'
+import { resourceFromAttributes } from '@opentelemetry/resources'
+import { ZoneContextManager } from '@opentelemetry/context-zone'
+import { W3CTraceContextPropagator } from '@opentelemetry/core'
+
+export const makeTracer = (serviceName: string) => {
+  const url = import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT
+  const provider = new WebTracerProvider({
+    spanProcessors:
+      url !== undefined
+        ? [new SimpleSpanProcessor(new OTLPTraceExporter({ url: `${url}/v1/traces` }))]
+        : [],
+    resource: resourceFromAttributes({ 'service.name': serviceName }),
+  })
+  provider.register({
+    contextManager: new ZoneContextManager(),
+    propagator: new W3CTraceContextPropagator(),
+  })
+  return provider.getTracer('livestore')
+}
+
+export const tracer = makeTracer('my-app')
+```
+
+```typescript
+// livestore.worker.ts — wire into the worker
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { tracer } from './otel.ts'
+import { schema } from './schema.ts'
+
+makeWorker({ schema, otelOptions: { tracer } })
+```
+
+Send traces to any OTLP-compatible backend (Honeycomb, Grafana Tempo, Jaeger, Datadog, and so on).
+
+### Key metrics to track
+
+- Sync push/pull latency (p50, p95, p99)
+- Number of active WebSocket connections to the sync backend
+- Unknown event rate (from your `unknownEventHandling` callback)
+- Materializer error rate
+
+## Security
+
+### Authentication checklist
+
+- [ ] Auth tokens are validated in `validatePayload` (Worker level)
+- [ ] Auth tokens are re-validated in `onPush` and `onPull` (Durable Object level)
+- [ ] Auth tokens have expiry and the client refreshes them
+- [ ] Token secrets are stored in environment variables, not hardcoded
+
+### Authorization checklist
+
+- [ ] Clients cannot push events to stores they do not have access to
+- [ ] Multi-tenant apps enforce per-tenant store isolation
+- [ ] The sync backend validates that the event author matches the authenticated user where required
+
+### Encryption
+
+LiveStore does not yet have built-in encryption. If your events contain sensitive data:
+
+- Encrypt event payloads at the schema level using a custom Effect Schema transformation before they are written to the log
+- Manage encryption keys outside the application bundle (key management service, environment variable rotation)
+- Consider end-to-end encryption if the sync backend should never see plaintext data
+
+See the [Auth and encryption guide](/guides/auth-and-encryption) for details.
+
+## App evolution
+
+### Managing schema changes across deployed clients
+
+After you deploy a new app version, old clients remain in the field. Plan for this:
+
+- Never remove a materializer for a retired event — old clients may still have those events in their logs
+- Configure `unknownEventHandling: 'callback'` so old clients log (but do not crash on) events from new app versions
+- For breaking changes, create a new event version (`v2.TodoCreated`) and keep the `v1` materializer
+
+### Deploying migrations
+
+If your new version requires data migrations (pre-populating a new table, backfilling a new column):
+
+1. Add a `migrations` table to track which migrations have run
+2. On app startup, check which migrations are pending
+3. Commit migration events to populate the new data
+4. Mark the migration as complete in the `migrations` table
+
+Because migrations are expressed as events, they are replayed consistently on every client and the migration state is part of the local database, not a separate deployment step.
+
+### Rolling back
+
+If a deployed version has a critical bug:
+
+- You cannot "un-commit" events that clients have already written to their local logs
+- Instead, deploy a new version that handles the bad events gracefully (via `unknownEventHandling` or corrective materializer logic)
+- For severe data corruption, a store reset (clearing the local database and replaying from the sync backend) is the recovery path
+
+## Pre-launch checklist
+
+<AccordionGroup>
+  <Accordion title="Schema and events">
+    - [ ] All event names are versioned (`v1.EventName`)
+    - [ ] `unknownEventHandling` is configured for production
+    - [ ] Materializers are deterministic and have no side effects
+    - [ ] Soft deletes used instead of hard deletes
+    - [ ] SQLite tables have appropriate indexes
+  </Accordion>
+  <Accordion title="Sync backend">
+    - [ ] Auth enforced at both Worker and Durable Object level
+    - [ ] Load tested with expected concurrent connections
+    - [ ] Logs and alerts configured
+    - [ ] Region selected for minimal latency to users
+  </Accordion>
+  <Accordion title="Performance">
+    - [ ] Persisted SQLite adapter used (not in-memory)
+    - [ ] All hot-path queries use indexed columns
+    - [ ] High-frequency events in a separate container from domain events
+  </Accordion>
+  <Accordion title="Testing">
+    - [ ] Unit tests cover event → materializer → state transitions
+    - [ ] Schema evolution tests cover mixed event version replays
+    - [ ] Offline sync tested with DevTools sync latch
+  </Accordion>
+  <Accordion title="Monitoring">
+    - [ ] OpenTelemetry configured and traces flowing to your backend
+    - [ ] Sync backend error rate alerts active
+    - [ ] Unknown event rate monitored
+  </Accordion>
+  <Accordion title="Security">
+    - [ ] Auth tokens validated in `validatePayload` and `onPush`
+    - [ ] Token secrets not hardcoded
+    - [ ] Multi-tenant store isolation verified
+    - [ ] Sensitive event payloads encrypted if required
+  </Accordion>
+</AccordionGroup>

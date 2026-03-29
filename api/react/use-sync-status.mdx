@@ -1,0 +1,118 @@
+---
+title: 'useSyncStatus'
+description: 'Subscribe to LiveStore synchronization status in a React component. Useful for connection indicators and offline-state handling.'
+---
+
+`useSyncStatus` returns the current synchronization status between the local client session and the leader thread. The component re-renders whenever the status changes.
+
+## Function signature
+
+```typescript
+function useSyncStatus(options: { store: Store<any> }): SyncStatus
+```
+
+Alternatively, call `store.useSyncStatus()` after getting a store from `useStore` — the `store` option is bound automatically.
+
+## Parameters
+
+<ParamField path="options.store" type="Store<any>" required>
+  The store instance to subscribe to. Pass this explicitly when using the standalone hook from `@livestore/react`, or omit it when calling `store.useSyncStatus()` from a store returned by `useStore`.
+</ParamField>
+
+## Return value
+
+<ResponseField name="status" type="SyncStatus">
+  The current sync status object.
+
+  <Expandable title="SyncStatus fields">
+    <ResponseField name="localHead" type="string">
+      The most recent event sequence number on the local client session. Format: `"e{global}.{client}"`, e.g. `"e5.2"`.
+    </ResponseField>
+    <ResponseField name="upstreamHead" type="string">
+      The sequence number confirmed by the leader thread. Format: `"e{global}"`, e.g. `"e3"`.
+    </ResponseField>
+    <ResponseField name="pendingCount" type="number">
+      Number of events committed locally but not yet confirmed by the leader thread. Zero when fully synced.
+    </ResponseField>
+    <ResponseField name="isSynced" type="boolean">
+      `true` when `pendingCount === 0`, meaning the local session is fully in sync with the leader.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Usage
+
+### Basic sync indicator
+
+```typescript
+import { useStore } from '@livestore/react'
+
+function SyncIndicator() {
+  const store = useStore(myStoreOptions)
+  const status = store.useSyncStatus()
+
+  return (
+    <span>
+      {status.isSynced
+        ? 'Synced'
+        : `Syncing (${status.pendingCount} pending)…`}
+    </span>
+  )
+}
+```
+
+### Standalone hook
+
+```typescript
+import { useSyncStatus } from '@livestore/react'
+
+function SyncIndicator({ store }) {
+  const status = useSyncStatus({ store })
+
+  return (
+    <span>{status.isSynced ? '✓ Synced' : `Syncing (${status.pendingCount} pending)…`}</span>
+  )
+}
+```
+
+### Visual connection badge
+
+```typescript
+function ConnectionBadge() {
+  const store = useStore(myStoreOptions)
+  const status = store.useSyncStatus()
+
+  return (
+    <div className={`badge ${status.isSynced ? 'badge--synced' : 'badge--pending'}`}>
+      {status.isSynced ? 'Online' : `${status.pendingCount} unsynced`}
+    </div>
+  )
+}
+```
+
+### Blocking navigation while unsynced
+
+```typescript
+function SaveButton() {
+  const store = useStore(myStoreOptions)
+  const status = store.useSyncStatus()
+
+  const handleSave = () => {
+    store.commit(events.documentSaved({ id: docId }))
+  }
+
+  return (
+    <button onClick={handleSave} disabled={!status.isSynced}>
+      {status.isSynced ? 'Save' : 'Saving…'}
+    </button>
+  )
+}
+```
+
+## How it works
+
+`useSyncStatus` reads the initial status synchronously from `store.syncStatus()`, then subscribes via `store.subscribeSyncStatus()`. The component re-renders whenever the status object changes. The hook exposes a debug label `LiveStore:useSyncStatus:synced` or `LiveStore:useSyncStatus:pending` in React DevTools.
+
+<Note>
+  `isSynced` reflects synchronization between the **client session and the leader thread**, not between the leader thread and a remote sync backend. To check remote connectivity, use a separate network status indicator.
+</Note>

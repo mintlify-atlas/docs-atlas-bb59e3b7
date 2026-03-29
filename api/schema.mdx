@@ -1,0 +1,414 @@
+---
+title: Schema
+description: Define your LiveStore data model with makeSchema, Events, State.SQLite tables, materializers, and column types.
+---
+
+The schema is the single source of truth for your LiveStore application. It defines the SQLite tables that hold state, the events that mutate state, and the materializers that translate events into table writes.
+
+## Complete example
+
+```typescript
+import {
+  defineMaterializer,
+  Events,
+  makeSchema,
+  Schema,
+  State,
+} from '@livestore/livestore'
+
+// 1. Define tables
+const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text(),
+      completed: State.SQLite.boolean({ default: false }),
+      createdAt: State.SQLite.integer({ default: () => Date.now() }),
+    },
+  }),
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+    default: { filter: 'all' },
+  }),
+} as const
+
+// 2. Define events
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({
+      id: Schema.String,
+      text: Schema.String,
+    }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  uiStateSet: Events.clientOnly({
+    name: 'UiStateSet',
+    schema: Schema.Struct({
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+  }),
+} as const
+
+// 3. Define materializers
+const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(
+    events.todoCreated,
+    ({ id, text }) => tables.todos.insert({ id, text, completed: false, createdAt: Date.now() }),
+  ),
+  [events.todoCompleted.name]: defineMaterializer(
+    events.todoCompleted,
+    ({ id }) => tables.todos.update({ completed: true }, { where: { id } }),
+  ),
+  [events.todoDeleted.name]: defineMaterializer(
+    events.todoDeleted,
+    ({ id }) => tables.todos.delete({ where: { id } }),
+  ),
+})
+
+// 4. Assemble state
+const state = State.SQLite.makeState({ tables, materializers })
+
+// 5. Build schema
+export const schema = makeSchema({ events, state })
+export { tables, events }
+```
+
+---
+
+## `makeSchema`
+
+Assembles a `LiveStoreSchema` from events and state.
+
+```typescript
+const makeSchema: <TInputSchema extends InputSchema>(
+  inputSchema: TInputSchema,
+) => FromInputSchema.DeriveSchema<TInputSchema>
+```
+
+<ParamField body="events" type="ReadonlyArray<EventDef> | Record<string, EventDef>" required>
+  Event definitions created with `Events.synced()` or `Events.clientOnly()`. You can pass an array or a plain object (object keys are ignored; event names come from `EventDef.name`).
+</ParamField>
+
+<ParamField body="state" type="InternalState" required>
+  The compiled state object returned by `State.SQLite.makeState()`.
+</ParamField>
+
+<ParamField body="unknownEventHandling" type="UnknownEvents.HandlingConfig" default="{ strategy: 'warn' }">
+  Controls what happens when the store encounters an event name it does not recognise (e.g. from a newer client version).
+
+  - `{ strategy: 'warn' }` — logs a warning and skips the event (default).
+  - `{ strategy: 'ignore' }` — silently skips the event.
+  - `{ strategy: 'error' }` — throws an error.
+</ParamField>
+
+<ParamField body="devtools.alias" type="string" default="'default'">
+  Label shown in the LiveStore DevTools to distinguish schemas when an app uses multiple.
+</ParamField>
+
+---
+
+## `Events.synced`
+
+Defines a synced event that is sent to the sync backend and distributed to all connected clients.
+
+```typescript
+const synced: <TName extends string, TType, TEncoded = TType>(
+  args: {
+    name: TName
+    schema: Schema.Schema<TType, TEncoded>
+    deprecated?: string
+    facts?: (args: TType, currentFacts: EventDefFacts) => { ... }
+  },
+) => EventDef<TName, TType, TEncoded>
+```
+
+<ParamField body="name" type="string" required>
+  Unique, versioned identifier for this event type (e.g. `'v1.TodoCreated'`). Versioning allows you to introduce `v2.TodoCreated` later without breaking existing clients.
+</ParamField>
+
+<ParamField body="schema" type="Schema.Schema<TType, TEncoded>" required>
+  Effect Schema used to validate and encode/decode event arguments. Must be a struct or similar serializable schema.
+</ParamField>
+
+<ParamField body="deprecated" type="string">
+  When set, a warning is logged at commit time. Use to guide consumers toward a replacement event.
+
+  ```typescript
+  Events.synced({
+    name: 'v1.TodoRenamed',
+    schema: Schema.Struct({ id: Schema.String, name: Schema.String }),
+    deprecated: "Use 'v1.TodoUpdated' instead",
+  })
+  ```
+</ParamField>
+
+```typescript
+const todoCreated = Events.synced({
+  name: 'v1.TodoCreated',
+  schema: Schema.Struct({
+    id: Schema.String,
+    text: Schema.String,
+    completed: Schema.Boolean,
+  }),
+})
+
+// Use as a constructor
+store.commit(todoCreated({ id: nanoid(), text: 'Buy milk', completed: false }))
+```
+
+---
+
+## `Events.clientOnly`
+
+Defines a client-only event that is synced across the same client's sessions (e.g., browser tabs) but never sent to the sync backend. Useful for local UI state.
+
+```typescript
+const clientOnly: <TName extends string, TType, TEncoded = TType>(
+  args: {
+    name: TName
+    schema: Schema.Schema<TType, TEncoded>
+    deprecated?: string
+  },
+) => EventDef<TName, TType, TEncoded>
+```
+
+```typescript
+const uiStateSet = Events.clientOnly({
+  name: 'UiStateSet',
+  schema: Schema.Struct({
+    selectedTodoId: Schema.NullOr(Schema.String),
+    filterMode: Schema.Literal('all', 'active', 'completed'),
+  }),
+})
+
+store.commit(uiStateSet({ selectedTodoId: 'abc', filterMode: 'active' }))
+```
+
+<Note>
+  Client-only events still require materializers and are stored in the local eventlog. They just don't participate in server-side sync.
+</Note>
+
+---
+
+## `State.SQLite.table`
+
+Defines a SQLite table. Accepts explicit column definitions or an Effect Schema.
+
+### With column definitions
+
+```typescript
+const todos = State.SQLite.table({
+  name: 'todos',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    text: State.SQLite.text(),
+    completed: State.SQLite.boolean({ default: false }),
+    createdAt: State.SQLite.integer({ default: () => Date.now() }),
+    priority: State.SQLite.integer({ nullable: true }),
+  },
+  indexes: [
+    { name: 'idx_todos_completed', columns: ['completed'] },
+  ],
+})
+```
+
+### With Effect Schema
+
+```typescript
+const UserSchema = Schema.Struct({
+  id: Schema.String.pipe(State.SQLite.withPrimaryKey),
+  email: Schema.String.pipe(State.SQLite.withUnique),
+  name: Schema.String,
+  active: Schema.Boolean.pipe(State.SQLite.withDefault(true)),
+  createdAt: Schema.optional(Schema.Date),
+}).annotations({ title: 'users' })
+
+const users = State.SQLite.table({ schema: UserSchema })
+```
+
+### Column types
+
+<ResponseField name="State.SQLite.text(options?)" type="ColumnDefinition">
+  A SQLite `TEXT` column. Maps to `Schema.String`.
+</ResponseField>
+
+<ResponseField name="State.SQLite.integer(options?)" type="ColumnDefinition">
+  A SQLite `INTEGER` column. Maps to `Schema.Number`.
+</ResponseField>
+
+<ResponseField name="State.SQLite.real(options?)" type="ColumnDefinition">
+  A SQLite `REAL` column. Maps to `Schema.Number`.
+</ResponseField>
+
+<ResponseField name="State.SQLite.boolean(options?)" type="ColumnDefinition">
+  A SQLite `INTEGER` column storing `0` / `1`. Maps to `Schema.Boolean`.
+</ResponseField>
+
+<ResponseField name="State.SQLite.blob(options?)" type="ColumnDefinition">
+  A SQLite `BLOB` column. Maps to `Schema.Uint8Array`.
+</ResponseField>
+
+<ResponseField name="State.SQLite.json(schema, options?)" type="ColumnDefinition">
+  Stores JSON-serializable data. Maps to any JSON-compatible schema.
+</ResponseField>
+
+<ResponseField name="State.SQLite.datetime(options?)" type="ColumnDefinition">
+  Stores a UTC timestamp as a SQLite `INTEGER`. Maps to `Schema.Date`.
+</ResponseField>
+
+Common column options:
+
+<ParamField body="primaryKey" type="boolean">
+  Mark this column as the primary key.
+</ParamField>
+
+<ParamField body="nullable" type="boolean" default="false">
+  Allow `NULL` values.
+</ParamField>
+
+<ParamField body="default" type="any | (() => any)">
+  Default value. Accepts a literal or a zero-argument function evaluated at insert time.
+</ParamField>
+
+### Schema annotations (when using Effect Schema)
+
+```typescript
+Schema.String.pipe(State.SQLite.withPrimaryKey)
+Schema.String.pipe(State.SQLite.withUnique)
+Schema.Boolean.pipe(State.SQLite.withDefault(true))
+Schema.Int.pipe(State.SQLite.withPrimaryKey, State.SQLite.withAutoIncrement)
+```
+
+---
+
+## Schema types
+
+LiveStore re-exports `Schema` from Effect. Use these types in event schemas and JSON column schemas:
+
+| Type | Description |
+| --- | --- |
+| `Schema.String` | UTF-8 string |
+| `Schema.Number` | Floating-point number |
+| `Schema.Int` | Integer (branded `number`) |
+| `Schema.Boolean` | `true` / `false` |
+| `Schema.Date` | `Date` object (encoded as ISO string) |
+| `Schema.DateFromNumber` | `Date` object (encoded as Unix milliseconds) |
+| `Schema.Null` | `null` |
+| `Schema.NullOr(S)` | `T \| null` |
+| `Schema.Literal(...)` | String / number literal union |
+| `Schema.Struct({ ... })` | Plain object |
+| `Schema.Array(S)` | Readonly array |
+| `Schema.Record({ key, value })` | Plain record |
+| `Schema.optional(S)` | Optional field in a `Struct` |
+| `Schema.Union(A, B, ...)` | Discriminated or plain union |
+| `Schema.JsonValue` | Any JSON-serializable value (untyped) |
+
+```typescript
+import { Schema } from '@livestore/livestore'
+
+const todoCreated = Events.synced({
+  name: 'v1.TodoCreated',
+  schema: Schema.Struct({
+    id: Schema.String,
+    text: Schema.String,
+    priority: Schema.Literal('low', 'medium', 'high'),
+    dueDate: Schema.NullOr(Schema.DateFromNumber),
+    tags: Schema.Array(Schema.String),
+  }),
+})
+```
+
+---
+
+## `sql` template tag
+
+A no-op tagged template literal that enables SQL syntax highlighting in editors without any runtime overhead.
+
+```typescript
+const sql: (template: TemplateStringsArray, ...args: unknown[]) => string
+```
+
+```typescript
+import { sql } from '@livestore/livestore'
+
+const colorCounts$ = queryDb({
+  query: sql`SELECT color, COUNT(*) as count FROM todos GROUP BY color`,
+  schema: Schema.Array(Schema.Struct({
+    color: Schema.String,
+    count: Schema.Number,
+  })),
+})
+```
+
+<Tip>
+  Install a VSCode extension such as "SQL tagged template literals" to get syntax highlighting inside `sql\`...\`` template literals.
+</Tip>
+
+---
+
+## `State.SQLite.makeState`
+
+Assembles the state object that `makeSchema` expects.
+
+```typescript
+const state = State.SQLite.makeState({
+  tables,
+  materializers,
+  migrations: { strategy: 'auto' }, // optional
+})
+```
+
+<ParamField body="tables" type="Record<string, TableDef> | ReadonlyArray<TableDef>" required>
+  All table definitions for the application.
+</ParamField>
+
+<ParamField body="materializers" type="Record<string, Materializer>" required>
+  Event-to-table write mappings produced by `State.SQLite.materializers()`.
+</ParamField>
+
+<ParamField body="migrations.strategy" type="'auto'" default="'auto'">
+  Currently only `'auto'` is supported. LiveStore automatically migrates tables when their schema hash changes.
+</ParamField>
+
+---
+
+## `State.SQLite.materializers`
+
+Creates the materializers map that maps each event name to a table write operation.
+
+```typescript
+const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(
+    events.todoCreated,
+    ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  ),
+  [events.todoDeleted.name]: defineMaterializer(
+    events.todoDeleted,
+    ({ id }) => tables.todos.delete({ where: { id } }),
+  ),
+})
+```
+
+### `defineMaterializer`
+
+Type-safe helper for defining a single materializer. The callback receives the decoded event args and returns a query builder expression.
+
+```typescript
+defineMaterializer(eventDef, (args) => tableExpression)
+```
+
+<Warning>
+  Every synced and client-only event must have a corresponding materializer. Missing materializers will cause a runtime error when the event is committed.
+</Warning>

@@ -1,97 +1,132 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: LiveStore
+description: An event-driven state management framework with reactive SQLite, built-in sync engine, and adapters for web, mobile, and server platforms.
 ---
 
-## Setting up
+LiveStore is a next-generation state management framework for building complex, client-centric applications. It replaces traditional state management libraries like Redux or Zustand with a powerful combination of reactive SQLite, event sourcing, and built-in real-time sync.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what LiveStore is and how it works
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quick Start (React)" icon="rocket" href="/getting-started/quickstart-react">
+    Get a React app running with LiveStore in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="cubes" href="/core/schema-and-events">
+    Understand schemas, events, materializers, and the store
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/create-store">
+    Explore the full API surface
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why LiveStore?
 
-Everything you need to create world-class documentation.
+LiveStore unifies state management, persistence, and sync into a single, principled model based on **event sourcing**. Instead of mutating state directly, you commit immutable events that are materialized into a local SQLite database and automatically synced across all connected clients.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Reactive SQLite" icon="database">
+    Query your data with full SQL support. Results update automatically when the underlying data changes — no loading states, no manual cache invalidation.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Built-in Sync" icon="arrows-rotate">
+    Events sync across clients via a push/pull model inspired by Git. Works offline automatically and reconciles state when connectivity returns.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Event Sourcing" icon="timeline">
+    Every change is captured as an immutable event. Replay, debug, undo, and audit your entire application history with ease.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install LiveStore">
+    Add the core package and the adapter for your platform.
+
+    ```bash
+    npm install @livestore/livestore @livestore/adapter-web @livestore/react
+    ```
+  </Step>
+  <Step title="Define your schema">
+    Declare events, SQLite tables, and the materializers that connect them.
+
+    ```typescript schema.ts
+    import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+    const tables = {
+      todos: State.SQLite.table({
+        name: 'todos',
+        columns: {
+          id: State.SQLite.text({ primaryKey: true }),
+          text: State.SQLite.text({ default: '' }),
+          completed: State.SQLite.boolean({ default: false }),
+        },
+      }),
+    }
+
+    const events = {
+      todoCreated: Events.synced({
+        name: 'v1.TodoCreated',
+        schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+      }),
+    }
+
+    const materializers = State.SQLite.materializers(events, {
+      'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text }),
+    })
+
+    export const schema = makeSchema({ events, state: State.SQLite.makeState({ tables, materializers }) })
+    ```
+  </Step>
+  <Step title="Create the store and query data">
+    Set up the store in your framework integration and start querying reactively.
+
+    ```typescript App.tsx
+    import { queryDb } from '@livestore/livestore'
+    import { useStore } from '@livestore/react'
+    import { schema, tables } from './schema'
+
+    const todos$ = queryDb(() => tables.todos, { label: 'todos' })
+
+    function TodoApp() {
+      const store = useStore({ storeId: 'my-app', schema, adapter, batchUpdates })
+      const todos = store.useQuery(todos$)
+      return (
+        <ul>
+          {todos.map(todo => <li key={todo.id}>{todo.text}</li>)}
+        </ul>
+      )
+    }
+    ```
+  </Step>
+  <Step title="Add sync (optional)">
+    Connect a Cloudflare sync backend to distribute state across clients in real time.
+
+    ```typescript src/livestore.worker.ts
+    import { makeWorker } from '@livestore/adapter-web/worker'
+    import { makeWsSync } from '@livestore/sync-cf/client'
+    import { schema } from './schema'
+
+    makeWorker({
+      schema,
+      sync: { backend: makeWsSync({ url: `${location.origin}/sync` }) },
+    })
+    ```
+  </Step>
+</Steps>
+
+## Explore by platform
+
+<CardGroup cols={2}>
+  <Card title="React Web" icon="react" href="/getting-started/quickstart-react">
+    Set up LiveStore in a React application with the web adapter
+  </Card>
+  <Card title="Expo (React Native)" icon="mobile" href="/getting-started/quickstart-expo">
+    Build offline-first mobile apps with the Expo adapter
+  </Card>
+  <Card title="Node.js" icon="server" href="/getting-started/quickstart-node">
+    Use LiveStore in server-side and CLI applications
+  </Card>
+  <Card title="Vue" icon="vuejs" href="/getting-started/quickstart-vue">
+    Integrate LiveStore into Vue 3 applications
+  </Card>
+</CardGroup>

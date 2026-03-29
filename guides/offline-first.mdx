@@ -1,0 +1,198 @@
+---
+title: Offline-first
+description: How LiveStore handles offline automatically, optimistic updates, event queuing, and UX patterns for displaying sync state.
+---
+
+LiveStore is designed with offline as a first-class concern, not an afterthought. Because every change is committed locally first and synced later, your app continues to work without a network connection by default.
+
+## How LiveStore handles offline automatically
+
+When a user commits an event, LiveStore:
+
+1. Writes the event to the local SQLite store immediately
+2. Applies materializers to update the local state tables
+3. Queues the event for sync with the backend
+4. When connectivity is available, pushes the queued events
+
+The application layer never needs to check connectivity before committing an event. From the UI's perspective, writes are always instant.
+
+<Note>
+Making your app fully offline-capable may require additional steps beyond LiveStore's built-in sync handling — for example, caching static assets with service workers and ensuring any external APIs you call are either optional or cached locally.
+</Note>
+
+## Optimistic updates
+
+All updates in LiveStore are inherently optimistic. When you call `store.commit(event)`, the state table is updated immediately in the local SQLite database. There is no loading state for writes, and no separate "optimistic update" API to learn.
+
+This differs from approaches where you update a server and then refresh local state. In LiveStore, the local event log is the source of truth and the server is a sync target.
+
+```typescript
+// This commits locally and reflects in the UI immediately,
+// regardless of network connectivity.
+store.commit(events.todoCreated({ id: nanoid(), text: 'Buy groceries' }))
+```
+
+The reactive query system picks up the change instantly:
+
+```typescript
+const todos$ = queryDb(tables.todos.select(), { label: 'todos' })
+
+function TodoList() {
+  const todos = useQuery(todos$) // updates as soon as the event is committed
+  // ...
+}
+```
+
+## Event queue: pending events persist locally
+
+Committed events that have not yet synced are stored in the local event log. If the user closes the app or loses connectivity, no data is lost — the events remain queued and are sent as soon as connectivity returns.
+
+This means:
+
+- Users can work offline for hours or days and their work is never lost
+- Reopening the app after a crash still has all pending events in the queue
+- The sync backend does not need to be available at commit time
+
+## What happens when connectivity returns
+
+When the sync backend becomes reachable again, LiveStore:
+
+1. Pushes any locally-committed events that were not yet synced
+2. Pulls any events that were committed by other clients while offline
+3. **Rebases** local events on top of the remote event log if necessary
+
+The rebase resolves divergence between local and remote history. Because events are immutable facts (not instructions that depend on current state), rebase is typically conflict-free. The materializers re-run against the merged log to produce the final consistent state.
+
+<Warning>
+If your app logic depends on the order of events from different clients (for example, a lock-acquire pattern), test your conflict resolution carefully. For most CRUD apps, the rebase is transparent.
+</Warning>
+
+## Tracking sync status
+
+Use `store.networkStatus` to observe the current connectivity state and react to changes.
+
+### Reading current status
+
+```typescript
+import { Effect, Stream } from 'effect'
+import type { Store } from '@livestore/livestore'
+
+declare const store: Store
+
+const status = await store.networkStatus.pipe(Effect.runPromise)
+if (status.isConnected === false) {
+  console.warn('Sync backend offline since', new Date(status.timestampMs))
+}
+```
+
+### Subscribing to changes
+
+```typescript
+await store.networkStatus.changes.pipe(
+  Stream.tap((next) => Effect.sync(() => console.log('network status updated', next))),
+  Stream.runDrain,
+  Effect.scoped,
+  Effect.runPromise,
+)
+```
+
+The `changes` stream emits every time the sync backend connection changes. Dispose of the subscription using the Effect scope you manage for your runtime.
+
+### DevTools latch simulation
+
+When you use DevTools to simulate an offline state, `status.devtools.latchClosed` is `true`. This lets you distinguish between a real network outage and a simulated one in your UI logic:
+
+```typescript
+const status = await store.networkStatus.pipe(Effect.runPromise)
+
+if (status.isConnected === false && status.devtools?.latchClosed) {
+  // Offline because DevTools closed the sync latch — development only
+} else if (status.isConnected === false) {
+  // Real connectivity issue
+}
+```
+
+## UX patterns for offline state
+
+### Showing a sync status indicator
+
+Display a small indicator in your UI that reflects the current connectivity. Users should know whether their changes have synced.
+
+<Tabs>
+  <Tab title="React">
+    ```tsx
+    import { useEffect, useState } from 'react'
+    import { Effect } from 'effect'
+
+    function SyncStatusBadge({ store }) {
+      const [isConnected, setIsConnected] = useState(true)
+
+      useEffect(() => {
+        const subscription = store.networkStatus.changes.pipe(
+          // Update component state on each change
+          Stream.tap((status) =>
+            Effect.sync(() => setIsConnected(status.isConnected))
+          ),
+          Stream.runDrain,
+          Effect.scoped,
+          Effect.runPromise,
+        )
+
+        return () => {
+          // dispose subscription
+        }
+      }, [store])
+
+      return (
+        <span className={isConnected ? 'badge-green' : 'badge-yellow'}>
+          {isConnected ? 'Synced' : 'Offline — changes saved locally'}
+        </span>
+      )
+    }
+    ```
+  </Tab>
+  <Tab title="Pattern guidance">
+    - Show "Offline" clearly but without alarm — the user's work is not at risk
+    - Avoid blocking the UI when offline; writes still work
+    - Show a "Syncing…" state briefly when connectivity returns
+    - Consider a count of unsynced changes for power users
+  </Tab>
+</Tabs>
+
+### Pending changes indicator
+
+You can query the local event log to count events that have not yet been confirmed by the sync backend and surface that count in your UI.
+
+### Disabling network-dependent features
+
+Some features — for example, sharing a document URL that others can access — require the sync backend to be reachable. Use the connectivity status to disable or hide these features gracefully rather than showing an error after the fact.
+
+```tsx
+function ShareButton({ store }) {
+  const [isConnected, setIsConnected] = useState(true)
+  // ... subscribe to store.networkStatus.changes
+
+  return (
+    <button disabled={!isConnected} title={!isConnected ? 'Unavailable offline' : undefined}>
+      Share
+    </button>
+  )
+}
+```
+
+## Testing offline behavior
+
+<Steps>
+  <Step title="Use the DevTools sync latch">
+    The LiveStore DevTools include a sync latch that closes the sync connection without affecting the rest of the application. Toggle it to simulate going offline and verify your UI responds correctly.
+  </Step>
+  <Step title="Test pending event persistence">
+    Commit several events while offline (latch closed), reload the page, then re-enable the latch. Confirm all events sync correctly and state is consistent.
+  </Step>
+  <Step title="Test concurrent edits">
+    Open two browser tabs with different simulated offline states. Make conflicting edits in each tab, then bring both online. Verify the final state is correct and consistent.
+  </Step>
+  <Step title="Write unit tests against the event log">
+    Use the in-memory adapter in tests to verify that specific sequences of events produce the expected state. Because state is deterministic from the event log, you don't need network mocking for unit tests.
+  </Step>
+</Steps>

@@ -1,0 +1,199 @@
+---
+title: '@livestore/adapter-web'
+description: 'Browser adapter for LiveStore. Provides persisted (OPFS) and in-memory storage with SharedWorker-based multi-tab coordination.'
+---
+
+`@livestore/adapter-web` runs LiveStore in a browser. It provides:
+
+- **`makePersistedAdapter`** — persisted storage in the [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system) with SharedWorker-based multi-tab leader election
+- **`makeInMemoryAdapter`** — ephemeral in-memory storage (no persistence across reloads)
+- **`makeSingleTabAdapter`** — persisted storage without SharedWorker (for browsers that don't support it)
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/adapter-web
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/adapter-web
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/adapter-web
+    ```
+  </Tab>
+</Tabs>
+
+## Exports
+
+```typescript
+import {
+  makePersistedAdapter,
+  makeInMemoryAdapter,
+  makeSingleTabAdapter,
+  canUseSharedWorker,
+} from '@livestore/adapter-web'
+```
+
+---
+
+## makePersistedAdapter
+
+Creates a web adapter with persistent OPFS storage. Requires a dedicated worker and a shared worker. On browsers without SharedWorker support (e.g. Android Chrome), it automatically falls back to single-tab mode.
+
+```typescript
+function makePersistedAdapter(options: WebAdapterOptions): Adapter
+```
+
+### Parameters
+
+<ParamField path="options.worker" type="((options) => Worker) | (new (options) => Worker)" required>
+  Constructor or factory for the dedicated worker. In Vite, use the `?worker` import:
+
+  ```typescript
+  import LiveStoreWorker from './livestore.worker.ts?worker'
+  ```
+</ParamField>
+
+<ParamField path="options.sharedWorker" type="((options) => SharedWorker) | (new (options) => SharedWorker)" required>
+  Constructor or factory for the shared worker. Import from `@livestore/adapter-web/shared-worker`:
+
+  ```typescript
+  import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+  ```
+</ParamField>
+
+<ParamField path="options.storage" type="StorageTypeEncoded" required>
+  Where to persist data. Currently only OPFS is supported:
+
+  ```typescript
+  storage: { type: 'opfs' }
+  ```
+</ParamField>
+
+<ParamField path="options.resetPersistence" type="boolean" default="false">
+  Wipes all persisted data for this store on startup. Use only during development.
+</ParamField>
+
+<ParamField path="options.clientId" type="string">
+  Stable identifier for this browser client. Defaults to a random ID stored in `localStorage` (shared across tabs).
+</ParamField>
+
+<ParamField path="options.sessionId" type="string">
+  Identifier for this browser tab/window. Defaults to a random ID stored in `sessionStorage` (unique per tab).
+</ParamField>
+
+### Worker file setup
+
+Create a `livestore.worker.ts` file that calls `makeWorker`:
+
+```typescript livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { schema } from './schema'
+
+makeWorker({ schema })
+```
+
+### Full example
+
+```typescript app.ts
+import { makePersistedAdapter } from '@livestore/adapter-web'
+import LiveStoreWorker from './livestore.worker.ts?worker'
+import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+
+export const adapter = makePersistedAdapter({
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+  storage: { type: 'opfs' },
+})
+```
+
+---
+
+## makeInMemoryAdapter
+
+Creates a web adapter with no persistence. Data is lost on page reload. Ideal for tests, demos, and sandboxes.
+
+```typescript
+function makeInMemoryAdapter(options?: InMemoryAdapterOptions): Adapter
+```
+
+### Parameters
+
+<ParamField path="options.sync" type="SyncOptions">
+  Optional sync backend. Useful when you want real-time collaboration without persistence.
+</ParamField>
+
+<ParamField path="options.importSnapshot" type="Uint8Array">
+  Pre-populate the in-memory database from an existing snapshot.
+</ParamField>
+
+<ParamField path="options.clientId" type="string">
+  Defaults to a random NanoID.
+</ParamField>
+
+<ParamField path="options.sessionId" type="string">
+  Defaults to a random NanoID.
+</ParamField>
+
+### Example
+
+```typescript
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+
+const adapter = makeInMemoryAdapter()
+```
+
+With a sync backend:
+
+```typescript
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+const adapter = makeInMemoryAdapter({
+  sync: {
+    backend: makeWsSync({ url: 'wss://sync.example.com' }),
+  },
+})
+```
+
+---
+
+## canUseSharedWorker
+
+Returns `true` when the `SharedWorker` API is available in the current browser context. Returns `false` on Android Chrome and other browsers that don't support it.
+
+```typescript
+function canUseSharedWorker(): boolean
+```
+
+`makePersistedAdapter` calls this internally and falls back to `makeSingleTabAdapter` automatically. Use it directly only if you need to branch UI behaviour based on SharedWorker availability.
+
+---
+
+## Vite configuration
+
+If you use the Vite development server, import the polyfill in your worker file to ensure hot-reloading works correctly:
+
+```typescript livestore.worker.ts
+import '@livestore/adapter-web/worker-vite-dev-polyfill'
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { schema } from './schema'
+
+makeWorker({ schema })
+```
+
+<Note>
+  The `storage: { type: 'opfs' }` option requires the browser to support the Origin Private File System API. LiveStore falls back to in-memory storage automatically in private browsing mode and other contexts where OPFS is unavailable, with a console warning.
+</Note>
+
+## Peer dependencies
+
+| Package | Version |
+|---|---|
+| `effect` | `^3.19.19` |

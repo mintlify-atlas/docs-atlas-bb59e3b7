@@ -1,0 +1,215 @@
+---
+title: '@livestore/adapter-node'
+description: 'Node.js adapter for LiveStore. Provides filesystem-persisted storage in single-threaded and multi-threaded modes.'
+---
+
+`@livestore/adapter-node` runs LiveStore in Node.js with SQLite-backed persistence on the filesystem. It exposes two adapters:
+
+- **`makeAdapter`** — single-threaded; leader logic runs in the same thread as your application
+- **`makeWorkerAdapter`** — multi-threaded; leader logic (persistence, sync, SQLite) runs in a separate worker thread
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/adapter-node
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/adapter-node
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/adapter-node
+    ```
+  </Tab>
+</Tabs>
+
+## Exports
+
+```typescript
+import { makeAdapter, makeWorkerAdapter } from '@livestore/adapter-node'
+```
+
+---
+
+## makeAdapter
+
+Creates a single-threaded Node.js adapter. The leader thread (persistence and sync) runs in the same thread as your application.
+
+Use this for CLI tools, scripts, and simple applications where simplicity matters more than throughput.
+
+```typescript
+function makeAdapter(options: NodeAdapterOptions & { sync?: SyncOptions }): Adapter
+```
+
+### Parameters
+
+<ParamField path="options.storage" type="StorageType" required>
+  Filesystem storage configuration:
+
+  ```typescript
+  storage: { type: 'fs', baseDirectory: './data' }
+  ```
+
+  Data is stored at `{baseDirectory}/{storeId}/`.
+</ParamField>
+
+<ParamField path="options.sync" type="SyncOptions">
+  Optional sync backend for multi-device synchronization.
+</ParamField>
+
+<ParamField path="options.clientId" type="string">
+  Stable identifier for this Node.js process. Defaults to the machine hostname.
+</ParamField>
+
+<ParamField path="options.sessionId" type="string" default="'static'">
+  Session identifier. The adapter does not currently support multiple concurrent sessions per client.
+</ParamField>
+
+<ParamField path="options.resetPersistence" type="boolean" default="false">
+  Deletes all persisted data for this store on startup. Use only during development.
+</ParamField>
+
+<ParamField path="options.devtools" type="object">
+  Enable the LiveStore DevTools server.
+
+  <Expandable title="devtools options">
+    <ParamField path="options.devtools.schemaPath" type="string | URL" required>
+      Path to your schema file, used by the DevTools UI.
+    </ParamField>
+    <ParamField path="options.devtools.port" type="number" default="4242">
+      Port for the DevTools server.
+    </ParamField>
+    <ParamField path="options.devtools.host" type="string" default="'localhost'">
+      Host for the DevTools server.
+    </ParamField>
+    <ParamField path="options.devtools.useExistingDevtoolsServer" type="boolean" default="false">
+      Connect to an already-running DevTools server instead of starting a new one.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Example
+
+```typescript
+import { createStorePromise, storeOptions } from '@livestore/livestore'
+import { makeAdapter } from '@livestore/adapter-node'
+import { makeWsSync } from '@livestore/sync-cf/client'
+import { schema } from './schema'
+
+const adapter = makeAdapter({
+  storage: { type: 'fs', baseDirectory: './data' },
+  sync: {
+    backend: makeWsSync({ url: 'wss://sync.example.com' }),
+  },
+})
+
+const store = await createStorePromise(
+  storeOptions({ schema, adapter, storeId: 'my-app' })
+)
+```
+
+---
+
+## makeWorkerAdapter
+
+Creates a multi-threaded Node.js adapter. The leader thread runs in a separate `worker_threads` worker, keeping your main thread responsive.
+
+Use this for production servers and performance-critical applications.
+
+```typescript
+function makeWorkerAdapter(
+  options: NodeAdapterOptions & {
+    workerUrl: URL
+    workerExtraArgs?: Schema.JsonValue
+  }
+): Adapter
+```
+
+### Parameters
+
+<ParamField path="options.workerUrl" type="URL" required>
+  URL of the worker file. Use `import.meta.url` to make it relative to the current file:
+
+  ```typescript
+  workerUrl: new URL('./livestore.worker.ts', import.meta.url)
+  ```
+</ParamField>
+
+<ParamField path="options.storage" type="StorageType" required>
+  Same as `makeAdapter`.
+</ParamField>
+
+<ParamField path="options.workerExtraArgs" type="Schema.JsonValue">
+  Extra arguments passed to the worker, accessible in the worker via `getWorkerArgs()`.
+</ParamField>
+
+All other options from `NodeAdapterOptions` also apply.
+
+### Worker file setup
+
+Create a worker file that calls `makeWorker`:
+
+```typescript livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-node/worker'
+import { schema } from './schema'
+
+makeWorker({ schema })
+```
+
+### Full example
+
+```typescript app.ts
+import { createStorePromise, storeOptions } from '@livestore/livestore'
+import { makeWorkerAdapter } from '@livestore/adapter-node'
+import { schema } from './schema'
+
+const adapter = makeWorkerAdapter({
+  storage: { type: 'fs', baseDirectory: './data' },
+  workerUrl: new URL('./livestore.worker.ts', import.meta.url),
+})
+
+const store = await createStorePromise(
+  storeOptions({ schema, adapter, storeId: 'my-app' })
+)
+```
+
+---
+
+## Worker exports
+
+`@livestore/adapter-node/worker` exports:
+
+### `makeWorker`
+
+Bootstraps the leader worker thread. Call once in your worker file.
+
+```typescript
+function makeWorker(options: WorkerOptions): void
+```
+
+<ParamField path="options.schema" type="LiveStoreSchema" required>
+  The schema to use in the leader thread.
+</ParamField>
+
+<ParamField path="options.sync" type="SyncOptions">
+  Optional sync backend.
+</ParamField>
+
+### `getWorkerArgs`
+
+Reads the arguments passed from the main thread via `workerExtraArgs`:
+
+```typescript
+function getWorkerArgs(): WorkerArgv
+```
+
+## Peer dependencies
+
+| Package | Version |
+|---|---|
+| `effect` | `^3.19.19` |

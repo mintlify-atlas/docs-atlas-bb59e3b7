@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "LiveStore",
+  "projectType": "framework",
+  "projectName": "LiveStore",
+  "projectDescription": "LiveStore is an event-driven state management framework with reactive SQLite, built-in sync engine, and adapters for web, mobile, and server platforms.",
   "theme": "palm",
-  "colors": {
-    "primary": "#fc7414",
-    "light": "#dcdcdc",
-    "dark": "#2c2c2c"
-  },
-  "favicon": "https://media.brand.dev/7f711a8c-7c69-4399-9ca2-57ae850e5c33.svg",
-  "logo": {
-    "light": "https://media.brand.dev/de9f3fd3-9aba-4478-89e7-3ee9bbcb3d1d.svg",
-    "dark": "https://media.brand.dev/de9f3fd3-9aba-4478-89e7-3ee9bbcb3d1d.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/livestorejs/livestore"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/livestorejs/livestore"
-    }
-  },
+  "primaryColor": "#fc7414",
+  "lightColor": "#dcdcdc",
+  "darkColor": "#2c2c2c",
   "navigation": {
     "tabs": [
       {
@@ -120,5 +103,41 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Event-driven state management with immutable eventlog",
+    "Reactive SQLite database with synchronous in-memory queries",
+    "Built-in sync engine with push/pull model (similar to Git)",
+    "Offline-first support with automatic conflict resolution",
+    "Fine-grained reactivity system with signals, computed values, and SQL queries",
+    "Cross-platform adapters (web, Expo/React Native, Node.js, Cloudflare Workers)",
+    "Framework integrations for React, Vue, Solid, and Svelte",
+    "Multiple sync providers (Cloudflare Durable Objects, ElectricSQL, S2)",
+    "DevTools with real-time data browser, eventlog inspector, and query inspector",
+    "TypeScript-first with full type safety via Effect Schema"
+  ],
+  "publicApiSurface": [
+    "createStore(options: CreateStoreOptions) => Store",
+    "createStorePromise(options: CreateStoreOptionsPromise) => Promise<Store>",
+    "StoreRegistry / storeOptions",
+    "makeStoreContext() — Effect layer integration",
+    "queryDb(query, schema) => LiveQueryDef",
+    "signal(initialValue, options?) => SignalDef",
+    "computed(fn, options?) => LiveQueryDef",
+    "sql template tag — tagged SQL query builder",
+    "useQuery(queryDef) — React hook",
+    "useStore() — React hook",
+    "useSyncStatus() — React hook",
+    "useClientDocument() — React hook",
+    "Store.commit(event) — commit an event",
+    "Store.query(queryDef) — query data imperatively",
+    "Store.subscribe(queryDef, callback) — subscribe to reactive state",
+    "makeSchemaTable() / Events.synced() / Events.clientOnly()",
+    "Schema (re-exported from Effect) for event/state schema definitions",
+    "@livestore/adapter-web — makeWebWorkerAdapter()",
+    "@livestore/adapter-node — makeNodeAdapter()",
+    "@livestore/adapter-expo — makeExpoAdapter()",
+    "@livestore/sync-cf — makeSyncBackend() / makeSyncProvider()",
+    "@livestore/cli — LiveStore CLI tool"
+  ]
 }

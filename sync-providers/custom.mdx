@@ -1,0 +1,252 @@
+---
+title: Custom sync provider
+description: Build your own LiveStore sync provider by implementing the SyncBackend interface.
+---
+
+You can build a custom sync provider for any transport or storage backend. A sync provider consists of two parts: a client-side `SyncBackend` implementation and a server-side event log.
+
+## How LiveStore syncing works
+
+LiveStore syncs the **event log**, not the SQLite database. Clients push locally committed events to the sync backend, and pull events that other clients have pushed. The sync backend is the global authority for event ordering — it enforces a total order by accepting events in sequence.
+
+Syncing follows a push/pull model similar to Git:
+1. A client pulls all upstream events it has not seen yet.
+2. If the client has local unpushed events, it rebases them on top of the upstream events.
+3. The client pushes its rebased events.
+
+The sync backend must serialize pushes (one push at a time) to guarantee a total event order. Pulls can be served in parallel.
+
+## Client-side: the `SyncBackend` interface
+
+Implement the `SyncBackend` interface from `@livestore/common`:
+
+```typescript my-sync-backend.ts
+import type { SyncBackend } from '@livestore/common'
+import type { LiveStoreEvent, EventSequenceNumber } from '@livestore/common/schema'
+import { Effect, Stream } from '@livestore/utils/effect'
+
+// Slightly simplified API
+// See packages/@livestore/common/src/sync/sync-backend.ts for the full type
+type SyncBackend = {
+  connect: Effect<void, IsOfflineError | UnknownError>
+  pull: (
+    cursor: Option<{ eventSequenceNumber: EventSequenceNumber; metadata: Option<SyncMetadata> }>,
+    options?: { live?: boolean },
+  ) => Stream<{ batch: LiveStoreEvent[]; pageInfo: PageInfo }, IsOfflineError | BackendIdMismatchError | UnknownError>
+  push: (
+    batch: readonly LiveStoreEvent[],
+  ) => Effect<void, IsOfflineError | BackendIdMismatchError | ServerAheadError | UnknownError>
+  ping: Effect<void, IsOfflineError | UnknownError>
+  isConnected: SubscriptionRef<boolean>
+  metadata: { name: string; description: string }
+}
+```
+
+### Skeleton implementation
+
+```typescript my-sync-backend.ts
+import { SyncBackend, UnknownError } from '@livestore/common'
+import { Effect, Option, Stream, SubscriptionRef } from '@livestore/utils/effect'
+
+export const makeMySyncBackend = (args: { endpoint: string }) =>
+  ({ storeId, payload }: { storeId: string; payload: unknown }) =>
+    Effect.gen(function* () {
+      const isConnected = yield* SubscriptionRef.make(false)
+
+      const ping = Effect.gen(function* () {
+        // Send a HEAD request or similar to check reachability
+        yield* Effect.tryPromise(() => fetch(args.endpoint, { method: 'HEAD' })).pipe(
+          Effect.andThen(() => SubscriptionRef.set(isConnected, true)),
+          Effect.catchAll(() => SubscriptionRef.set(isConnected, false)),
+        )
+      })
+
+      return SyncBackend.of({
+        connect: ping.pipe(Effect.mapError((e) => new UnknownError({ cause: e }))),
+
+        pull: (cursor, options) =>
+          Stream.fromEffect(
+            Effect.tryPromise(async () => {
+              const seqNum = Option.isSome(cursor) ? cursor.value.eventSequenceNumber : 0
+              const res = await fetch(`${args.endpoint}?storeId=${storeId}&since=${seqNum}`)
+              const { events } = await res.json()
+              return { batch: events, pageInfo: SyncBackend.pageInfoNoMore }
+            }),
+          ).pipe(
+            Stream.mapError((cause) => new UnknownError({ cause })),
+          ),
+
+        push: (batch) =>
+          Effect.tryPromise(() =>
+            fetch(args.endpoint, {
+              method: 'POST',
+              body: JSON.stringify({ storeId, batch }),
+              headers: { 'content-type': 'application/json' },
+            }),
+          ).pipe(
+            Effect.mapError((cause) => new UnknownError({ cause })),
+            Effect.asVoid,
+          ),
+
+        ping,
+        isConnected,
+        metadata: {
+          name: 'my-sync-backend',
+          description: 'Custom sync backend',
+          protocol: 'http',
+          endpoint: args.endpoint,
+        },
+        supports: {
+          pullPageInfoKnown: false,
+          pullLive: false,
+        },
+      })
+    })
+```
+
+### Wiring into the adapter
+
+```typescript store.ts
+import { makeAdapter } from '@livestore/adapter-web'
+import { makeMySyncBackend } from './my-sync-backend.ts'
+
+const adapter = makeAdapter({
+  sync: {
+    backend: makeMySyncBackend({
+      endpoint: 'https://sync.example.com/api/sync',
+    }),
+  },
+})
+```
+
+## Server-side: the event log
+
+The sync backend must maintain an **append-only event log** and support cursor-based queries.
+
+### Push handler requirements
+
+<Steps>
+  <Step title="Validate the batch">
+    - Ensure sequence numbers are in ascending order.
+    - Ensure the first event's `seqNum` is exactly `currentHead + 1`. If the client is behind, return a `ServerAheadError` to trigger a rebase.
+    - Optionally validate event schemas or authorization.
+  </Step>
+  <Step title="Persist events atomically">
+    Append the events to the event log. Update the head to the sequence number of the last event. This must be done atomically to prevent races.
+  </Step>
+  <Step title="Return success">
+    Return a success response to the client. Optionally notify other connected clients that new events are available.
+  </Step>
+</Steps>
+
+<Warning>
+  The server must process only one push request at a time per store. Concurrent pushes would break the total event order. Use a mutex, a transaction with a row lock, or route all pushes for a `storeId` to the same process (as Cloudflare Durable Objects do).
+</Warning>
+
+### Pull handler requirements
+
+<Steps>
+  <Step title="Validate the cursor">
+    Check that the requested cursor is within the valid range of the event log.
+  </Step>
+  <Step title="Query events from the cursor">
+    Return all events with `seqNum > cursor` in ascending order. You may return them in pages or as a stream.
+  </Step>
+  <Step title="Optionally support live pull">
+    For real-time delivery, keep the connection open (WebSocket, SSE, or long-polling) and push new events as they arrive. Without live pull, the client will poll on an interval.
+  </Step>
+</Steps>
+
+Pull requests can be handled in parallel — they are read-only.
+
+### Minimal server example
+
+```typescript server.ts
+// Pseudocode: minimal HTTP sync backend
+
+// In-memory event log (replace with a real database)
+const eventLogs: Map<string, { events: any[]; head: number }> = new Map()
+
+// POST /sync - Push events
+async function handlePush(storeId: string, batch: any[]) {
+  const log = eventLogs.get(storeId) ?? { events: [], head: -1 }
+
+  const firstSeqNum = batch[0]?.seqNum
+  if (firstSeqNum !== log.head + 1) {
+    // Client is behind — tell it to rebase
+    return { error: 'ServerAhead', head: log.head }
+  }
+
+  // Validate ascending order
+  for (let i = 1; i < batch.length; i++) {
+    if (batch[i].seqNum !== batch[i - 1].seqNum + 1) {
+      return { error: 'InvalidBatch' }
+    }
+  }
+
+  log.events.push(...batch)
+  log.head = batch.at(-1)!.seqNum
+  eventLogs.set(storeId, log)
+
+  return { success: true }
+}
+
+// GET /sync?storeId=...&since=... - Pull events
+async function handlePull(storeId: string, since: number) {
+  const log = eventLogs.get(storeId) ?? { events: [], head: -1 }
+  const events = log.events.filter((e) => e.seqNum > since)
+  return { events }
+}
+```
+
+## Reactivity (live pull)
+
+Without a push notification mechanism, clients must poll for new events. To implement live pull:
+
+| Mechanism | Use case |
+|-----------|----------|
+| WebSocket | Lowest latency; bidirectional; ideal when clients also push frequently |
+| Server-Sent Events (SSE) | Simple unidirectional streaming; good for HTTP/2 environments |
+| HTTP long-polling | Works anywhere; higher overhead; last resort |
+
+When a push arrives, notify all WebSocket/SSE connections subscribed to the same `storeId`.
+
+## `backendId` and backend reset detection
+
+If your backend can be reset (data deleted), generate a `backendId` when the store is first initialized and include it in pull responses. Clients store the `backendId` locally and send it on subsequent syncs. If the IDs differ, the client knows the backend was reset.
+
+The client-side behavior is configured via `onBackendIdMismatch`:
+
+```typescript
+const store = await makeStore({
+  sync: {
+    backend: syncBackend,
+    onBackendIdMismatch: 'reset', // 'reset' | 'shutdown' | 'ignore'
+  },
+})
+```
+
+See the [Cloudflare provider](/sync-providers/cloudflare) for a reference implementation of this pattern.
+
+## Design decisions
+
+**Why require a central backend?**
+
+LiveStore requires a central sync backend to enforce a **global total order** of events. This is necessary for deterministic state materialization: every client must replay events in the same order to arrive at the same state. Without a total order, concurrent events from different clients would produce divergent states.
+
+This means LiveStore cannot operate in a fully decentralized (P2P) mode. The sync backend is the arbiter of event ordering.
+
+**Why rebase on the client?**
+
+Rebasing (replaying local events on top of new upstream events) happens on the client rather than on the server. This gives application code more control over conflict resolution and keeps the server simple: it only needs to persist and query events, not understand their semantics.
+
+**Why an append-only log?**
+
+Treating the event log as immutable simplifies sync: clients can always reconstruct state by replaying from any cursor. It also makes it straightforward to detect tampering (events should never be updated or deleted).
+
+## Further reading
+
+- [Syncing concepts](/core/syncing) — how LiveStore's sync model works
+- [Cloudflare provider](/sync-providers/cloudflare) — reference implementation using Durable Objects
+- [ElectricSQL provider](/sync-providers/electricsql) — reference implementation using Postgres
+- [Distributed Systems by Martin Kleppmann](https://www.youtube.com/playlist?list=PLeKd45zvjcDFUEv_ohr_HdUFe97RItdiB) — background on event ordering and distributed systems

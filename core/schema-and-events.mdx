@@ -1,0 +1,302 @@
+---
+title: 'Schema and events'
+description: 'Define your LiveStore schema, declare events, and commit data changes to the event log.'
+---
+
+A LiveStore **schema** is the single source of truth for your application. It combines three things:
+
+- **Events** — the named, versioned actions that describe every change to your data
+- **State** — the SQLite tables derived from those events
+- **Materializers** — the functions that map events onto state
+
+Everything flows from events. State is always a projection of the event log, never mutated directly.
+
+## Defining events
+
+LiveStore provides two event types:
+
+<AccordionGroup>
+  <Accordion title="Events.synced()">
+    Synced across all clients via the sync backend. Use these for shared application data.
+
+    ```typescript schema.ts
+    import { Events, Schema } from '@livestore/livestore'
+
+    export const events = {
+      todoCreated: Events.synced({
+        name: 'v1.TodoCreated',
+        schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+      }),
+      todoCompleted: Events.synced({
+        name: 'v1.TodoCompleted',
+        schema: Schema.Struct({ id: Schema.String }),
+      }),
+    } as const
+    ```
+  </Accordion>
+  <Accordion title="Events.clientOnly()">
+    Processed locally on the client only. These are still synced across sessions within the same client (e.g. across browser tabs), but are never pushed to the central sync backend.
+
+    Use client-only events for ephemeral UI state, draft content, or anything that should not be shared with other users.
+  </Accordion>
+</AccordionGroup>
+
+### Event schema
+
+Event arguments are defined using [Effect Schema](https://effect.website/docs/schema/introduction). The schema encodes and decodes event payloads automatically when events are stored and retrieved.
+
+Common schema types:
+
+| Schema type | TypeScript type |
+|---|---|
+| `Schema.String` | `string` |
+| `Schema.Number` | `number` |
+| `Schema.Boolean` | `boolean` |
+| `Schema.Date` | `Date` |
+| `Schema.Struct({ ... })` | object |
+| `Schema.Array(T)` | `T[]` |
+| `Schema.optional(T)` | `T \| undefined` |
+| `Schema.Literal('a', 'b')` | `'a' \| 'b'` |
+
+### Full schema example
+
+```typescript schema.ts
+import { Events, makeSchema, Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+      deletedAt: State.SQLite.integer({ nullable: true, schema: Schema.DateFromNumber }),
+    },
+  }),
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({ newTodoText: Schema.String, filter: Schema.Literal('all', 'active', 'completed') }),
+    default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+  }),
+}
+
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Date }),
+  }),
+} as const
+
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+  'v1.TodoDeleted': ({ id, deletedAt }) => tables.todos.update({ deletedAt }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+
+export const schema = makeSchema({ events, state })
+```
+
+## Committing events
+
+Call `store.commit()` with an event created by your event definition:
+
+```typescript
+import type { Store } from '@livestore/livestore'
+import { events } from './schema.ts'
+
+declare const store: Store
+
+store.commit(events.todoCreated({ id: '1', text: 'Buy milk' }))
+```
+
+The commit is synchronous from the caller's perspective. LiveStore immediately applies the event to local state, then propagates it to the sync backend in the background.
+
+<Tip>
+  When generating IDs, use a globally unique generator to avoid conflicts. `@livestore/livestore` re-exports `nanoid` for convenience:
+
+  ```typescript
+  import { nanoid } from '@livestore/livestore'
+  store.commit(events.todoCreated({ id: nanoid(), text: 'Buy milk' }))
+  ```
+</Tip>
+
+## Naming best practices
+
+<Steps>
+  <Step title="Use past tense">
+    Name events after things that already happened: `todoCreated`, `todoCompleted`, `userInvited`. Avoid imperative names like `createTodo` or `inviteUser`.
+  </Step>
+  <Step title="Version your events">
+    Prefix names with a version: `v1.TodoCreated`. This makes it easier to introduce breaking changes later by adding a `v2.TodoCreated` alongside the original.
+  </Step>
+  <Step title="Prefer soft deletes">
+    Add a `deletedAt` column instead of a `DELETE` event. This avoids common concurrency issues when events arrive out of order.
+  </Step>
+</Steps>
+
+## Event format
+
+Each event stored in the event log has the following fields:
+
+| Field | Description |
+|---|---|
+| `name` | Event name matching the event definition |
+| `args` | Event arguments encoded by the event's schema |
+| `seqNum` | Sequence number identifying this event |
+| `parentSeqNum` | Parent event's sequence number (for causal ordering) |
+| `clientId` | Identifier of the client that created the event |
+| `sessionId` | Identifier of the session |
+
+### Encoded vs decoded
+
+Events exist in two representations. LiveStore handles conversion automatically.
+
+<CodeGroup>
+
+```json decoded
+{
+  "name": "v1.TodoCreated",
+  "args": { "id": "abc123", "text": "Buy milk", "createdAt": "Date object" },
+  "seqNum": 5,
+  "parentSeqNum": 4,
+  "clientId": "client-xyz",
+  "sessionId": "session-123"
+}
+```
+
+```json encoded (storage/sync)
+{
+  "name": "v1.TodoCreated",
+  "args": { "id": "abc123", "text": "Buy milk", "createdAt": "2024-01-15T10:30:00.000Z" },
+  "seqNum": 5,
+  "parentSeqNum": 4,
+  "clientId": "client-xyz",
+  "sessionId": "session-123"
+}
+```
+
+</CodeGroup>
+
+### Event type namespaces
+
+LiveStore uses three event namespaces depending on context:
+
+```typescript
+import { EventSequenceNumber, type LiveStoreEvent } from '@livestore/livestore'
+
+// Input events (no sequence numbers) — used when committing
+const input: LiveStoreEvent.Input.Decoded = {
+  name: 'v1.TodoCreated',
+  args: { id: 'abc123', text: 'Buy milk' },
+}
+
+// Global events (sync backend format) — integer sequence numbers
+const global: LiveStoreEvent.Global.Encoded = {
+  name: 'v1.TodoCreated',
+  args: { id: 'abc123', text: 'Buy milk' },
+  seqNum: EventSequenceNumber.Global.make(5),
+  parentSeqNum: EventSequenceNumber.Global.make(4),
+  clientId: 'client-xyz',
+  sessionId: 'session-123',
+}
+
+// Client events (local format) — composite sequence numbers
+const client: LiveStoreEvent.Client.Encoded = {
+  name: 'v1.TodoCreated',
+  args: { id: 'abc123', text: 'Buy milk' },
+  seqNum: EventSequenceNumber.Client.Composite.make({ global: 5, client: 0, rebaseGeneration: 0 }),
+  parentSeqNum: EventSequenceNumber.Client.Composite.make({ global: 4, client: 0, rebaseGeneration: 0 }),
+  clientId: 'client-xyz',
+  sessionId: 'session-123',
+}
+```
+
+## Schema evolution
+
+Event definitions can evolve, but some changes are irreversible.
+
+<Warning>
+  Event definitions can never be removed once added. Older clients may still emit them, and the event log always contains the full history.
+</Warning>
+
+**Safe (backward-compatible) changes:**
+
+- Add new optional fields or fields with default values to an event's `Schema.Struct`
+- Remove fields from a `Schema.Struct`
+
+**Unsafe changes (require a new event version):**
+
+- Changing the type of an existing field
+- Making an optional field required
+- Renaming a field
+
+To introduce a breaking change, define a new event alongside the original:
+
+```typescript
+export const events = {
+  // Original — keep for backward compatibility
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  // New version with additional field
+  todoCreatedV2: Events.synced({
+    name: 'v2.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String, priority: Schema.Number }),
+  }),
+} as const
+```
+
+## Unknown event handling
+
+When a client receives an event it doesn't recognise (e.g. from a newer app version), LiveStore applies the `unknownEventHandling` strategy set on the schema:
+
+```typescript
+import { makeSchema } from '@livestore/livestore'
+
+const schema = makeSchema({
+  events,
+  state,
+  unknownEventHandling: {
+    strategy: 'callback',
+    onUnknownEvent: (event, error) => {
+      console.warn('LiveStore saw an unknown event', { event, reason: error.reason })
+    },
+  },
+})
+```
+
+| Strategy | Behaviour |
+|---|---|
+| `'warn'` (default) | Logs a warning for every unknown event |
+| `'ignore'` | Silently skips unknown events |
+| `'fail'` | Halts immediately when an unknown event is encountered |
+| `'callback'` | Calls your handler; useful for custom telemetry |
+
+## Streaming events
+
+You can iterate over confirmed events from the sync backend:
+
+```typescript
+import type { Store } from '@livestore/livestore'
+
+declare const store: Store
+
+for await (const event of store.events()) {
+  console.log('event from leader', event)
+}
+```
+
+<Note>
+  Only events confirmed by the sync backend are available via `store.events()`. Pending local events are not included.
+</Note>

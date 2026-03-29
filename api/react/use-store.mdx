@@ -1,0 +1,237 @@
+---
+title: 'useStore'
+description: 'Access a LiveStore store instance in a React component. Suspends until the store is loaded and augments it with React-specific hooks.'
+---
+
+`useStore` retrieves a `Store` instance from the nearest `StoreRegistryProvider` and augments it with React hooks (`store.useQuery()`, `store.useClientDocument()`, `store.useSyncStatus()`). The component suspends until the store has finished loading.
+
+## Function signature
+
+```typescript
+function useStore<
+  TSchema extends LiveStoreSchema,
+  TContext = {},
+  TSyncPayloadSchema extends Schema.Schema<any> = typeof Schema.JsonValue,
+>(
+  options: RegistryStoreOptions<TSchema, TContext, TSyncPayloadSchema>,
+): Store<TSchema, TContext> & ReactApi
+```
+
+## Parameters
+
+<ParamField path="options" type="RegistryStoreOptions<TSchema, TContext, TSyncPayloadSchema>" required>
+  Store options created with `storeOptions()`. These identify which store to load and configure how it behaves.
+
+  ```typescript
+  const myStoreOptions = storeOptions({
+    schema,
+    adapter,
+    storeId: 'my-app',
+  })
+  ```
+
+  Multiple calls with the same `storeId` return the same cached store instance. Store options are only applied when the store is first loaded — subsequent calls with different options for the same `storeId` have no effect while the store is cached.
+</ParamField>
+
+## Return value
+
+<ResponseField name="store" type="Store<TSchema, TContext> & ReactApi">
+  The loaded store instance augmented with React methods:
+
+  <Expandable title="ReactApi methods">
+    <ResponseField name="store.useQuery" type="(queryable, options?) => Queryable.Result">
+      Hook version of `useQuery`. Equivalent to `useQuery(queryable, { store })`. See [`useQuery`](/api/react/use-query).
+    </ResponseField>
+    <ResponseField name="store.useClientDocument" type="(table, idOrOptions?, options?) => UseClientDocumentResult">
+      Hook for reading and writing `clientDocument` tables with React state semantics.
+    </ResponseField>
+    <ResponseField name="store.useSyncStatus" type="() => SyncStatus">
+      Hook for subscribing to sync status. See [`useSyncStatus`](/api/react/use-sync-status).
+    </ResponseField>
+    <ResponseField name="store.commit" type="(event | event[]) => void">
+      Commits one or more events to the event log. This is the only way to mutate data in LiveStore.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Usage
+
+### Basic usage
+
+```typescript
+import { useStore } from '@livestore/react'
+import { storeOptions } from '@livestore/livestore'
+import { schema, events, tables } from './schema'
+import { makePersistedAdapter } from '@livestore/adapter-web'
+
+const adapter = makePersistedAdapter({ /* ... */ })
+
+const myStoreOptions = storeOptions({ schema, adapter, storeId: 'my-app' })
+
+function TodoList() {
+  const store = useStore(myStoreOptions)
+  const todos = store.useQuery(queryDb(tables.todos.query))
+
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id}>{todo.text}</li>
+      ))}
+    </ul>
+  )
+}
+```
+
+### Committing events
+
+Use `store.commit()` to dispatch events that update the database:
+
+```typescript
+function AddTodo() {
+  const store = useStore(myStoreOptions)
+
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    const data = new FormData(e.currentTarget)
+    store.commit(
+      events.todoCreated({ id: nanoid(), text: data.get('text') as string })
+    )
+    e.currentTarget.reset()
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="text" placeholder="New todo" />
+      <button type="submit">Add</button>
+    </form>
+  )
+}
+```
+
+### Committing multiple events at once
+
+```typescript
+store.commit([
+  events.todoCreated({ id: nanoid(), text: 'First task' }),
+  events.todoCreated({ id: nanoid(), text: 'Second task' }),
+])
+```
+
+### Per-entity stores
+
+`useStore` supports dynamic store IDs. The store is loaded (or retrieved from cache) based on the resolved `storeId`:
+
+```typescript
+const issueStoreOptions = (issueId: string) =>
+  storeOptions({ schema, adapter, storeId: issueId })
+
+function IssueDetail({ issueId }: { issueId: string }) {
+  const store = useStore(issueStoreOptions(issueId))
+  const [issue] = store.useQuery(queryDb(tables.issue.query.first()))
+
+  const toggleStatus = () =>
+    store.commit(
+      events.issueStatusChanged({
+        id: issue.id,
+        status: issue.status === 'done' ? 'todo' : 'done',
+      })
+    )
+
+  return (
+    <>
+      <h2>{issue.title}</h2>
+      <button onClick={toggleStatus}>Toggle status</button>
+    </>
+  )
+}
+```
+
+---
+
+## StoreRegistryProvider
+
+`useStore` reads from the nearest `StoreRegistryProvider`. Wrap your application (or a subtree) with this provider to make stores available:
+
+```typescript
+import { StoreRegistry } from '@livestore/livestore'
+import { StoreRegistryProvider } from '@livestore/react'
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+
+const storeRegistry = new StoreRegistry({
+  defaultOptions: { batchUpdates },
+})
+
+function App() {
+  return (
+    <StoreRegistryProvider storeRegistry={storeRegistry}>
+      <Suspense fallback={<p>Loading…</p>}>
+        <TodoList />
+      </Suspense>
+    </StoreRegistryProvider>
+  )
+}
+```
+
+<Warning>
+  `useStore` suspends the component until the store is ready. Wrap the component tree in a `<Suspense>` boundary to show a loading state.
+</Warning>
+
+---
+
+## useStoreRegistry
+
+Use `useStoreRegistry` when you need the `StoreRegistry` directly — for example, to preload stores before navigating:
+
+```typescript
+import { useStoreRegistry } from '@livestore/react'
+
+function PreloadButton({ issueId }: { issueId: string }) {
+  const storeRegistry = useStoreRegistry()
+
+  const handleMouseEnter = () => {
+    storeRegistry.preload({
+      ...issueStoreOptions(issueId),
+      unusedCacheTime: 10_000,
+    })
+  }
+
+  return <button onMouseEnter={handleMouseEnter}>View issue</button>
+}
+```
+
+### Function signature
+
+```typescript
+function useStoreRegistry(override?: StoreRegistry): StoreRegistry
+```
+
+<ParamField path="override" type="StoreRegistry">
+  Optional registry to use instead of reading from context. When provided, the context lookup is skipped entirely.
+</ParamField>
+
+Throws if called outside a `<StoreRegistryProvider>` and no `override` is provided.
+
+---
+
+## withReactApi
+
+`withReactApi` is called automatically by `useStore`. You do not need it in normal application code. It attaches `useQuery`, `useClientDocument`, and `useSyncStatus` to an existing `Store` instance:
+
+```typescript
+import { withReactApi } from '@livestore/react'
+
+const storeWithHooks = withReactApi(store)
+storeWithHooks.useQuery(queryDb(tables.todos.query))
+```
+
+### Function signature
+
+```typescript
+function withReactApi<TSchema extends LiveStoreSchema, TContext = {}>(
+  store: Store<TSchema, TContext>,
+): Store<TSchema, TContext> & ReactApi
+```
+
+<Note>
+  `useStore` caches stores by `storeId` in the `StoreRegistry`. Stores remain cached for `unusedCacheTime` milliseconds after the last component unmounts (default: 60,000 ms in browsers, `Infinity` in non-browser environments).
+</Note>

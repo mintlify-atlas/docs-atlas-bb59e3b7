@@ -1,0 +1,271 @@
+---
+title: Auth and encryption
+description: How to integrate authentication, pass auth tokens to the sync backend, enforce authorization, and encrypt event payloads in LiveStore.
+---
+
+LiveStore does not include built-in authentication or authorization. This guide explains how to integrate your own auth system, pass credentials to the sync backend, control access per store, and encrypt event payloads before they leave the client.
+
+## Authentication
+
+### LiveStore has no built-in auth
+
+Authentication is an application-level concern in LiveStore. The framework does not issue sessions, validate tokens, or manage user identities. Your application owns the full auth flow — login, token refresh, and session management — and LiveStore provides a hook (`syncPayload`) to pass the result of that flow to your sync backend.
+
+This separation keeps LiveStore focused on state management and sync while letting you use any auth library you prefer (Auth.js, Better Auth, Clerk, Supabase Auth, custom JWTs, and so on).
+
+### Passing an auth token to the sync backend
+
+Use the `syncPayload` option when creating the store to attach a custom payload that your sync backend receives on every connection.
+
+```tsx
+import { Suspense, useState } from 'react'
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { type LiveStoreSchema, StoreRegistry } from '@livestore/livestore'
+import { StoreRegistryProvider, useStore } from '@livestore/react'
+
+const useAppStore = () =>
+  useStore({
+    storeId,
+    schema,
+    adapter,
+    batchUpdates,
+    syncPayload: {
+      authToken: user.jwt, // JWT from your auth system
+    },
+  })
+```
+
+The sync backend receives this payload in `validatePayload` and can allow or reject the connection:
+
+```typescript
+import * as jose from 'jose'
+import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+
+const JWT_SECRET = 'a-string-secret-at-least-256-bits-long'
+
+export class SyncBackendDO extends makeDurableObject({
+  onPush: async (message) => {
+    console.log('onPush', message.batch)
+  },
+  onPull: async (message) => {
+    console.log('onPull', message)
+  },
+}) {}
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  validatePayload: async (payload: any, context) => {
+    const { storeId } = context
+    const { authToken } = payload
+
+    if (authToken == null) {
+      throw new Error('No auth token provided')
+    }
+
+    const user = await getUserFromToken(authToken)
+
+    if (user == null) {
+      throw new Error('Invalid auth token')
+    }
+
+    if (payload.exp !== undefined && payload.exp < Date.now() / 1000) {
+      throw new Error('Token expired')
+    }
+
+    await checkUserAccess(user, storeId)
+  },
+  enableCORS: true,
+})
+
+const getUserFromToken = async (token: string): Promise<jose.JWTPayload | undefined> => {
+  try {
+    const { payload } = await jose.jwtVerify(token, new TextEncoder().encode(JWT_SECRET))
+    return payload
+  } catch (error) {
+    console.log('Error verifying token', error)
+    return undefined
+  }
+}
+```
+
+This example uses [`jose`](https://www.npmjs.com/package/jose), a JavaScript JWT library that works across Node.js, Cloudflare Workers, Deno, Bun, and browsers.
+
+<Note>
+If the token fails validation, LiveStore rejects the sync connection but the client app continues to work locally. Any events committed while unauthenticated are queued and sync as soon as the user re-authenticates.
+</Note>
+
+### Cookie-based authentication
+
+If your auth system uses cookies (for example, with [Better Auth](https://www.better-auth.com/)), use the `forwardHeaders` option to pass session cookies to your sync backend callbacks.
+
+Passing tokens in URL parameters (`syncPayload`) exposes them in browser history, server logs, and referrer headers. Cookie-based auth avoids these issues because cookies are sent automatically and are not visible in URLs.
+
+```typescript
+import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+
+export class SyncBackendDO extends makeDurableObject({
+  // Forward Cookie and Authorization headers to onPush/onPull callbacks
+  forwardHeaders: ['Cookie', 'Authorization'],
+
+  onPush: async (message, context) => {
+    const { storeId, headers } = context
+    const cookie = headers?.get('cookie')
+    if (cookie != null) {
+      const sessionToken = parseCookie(cookie, 'session_token')
+      const session = await getSessionFromToken(sessionToken)
+      if (session == null) throw new Error('Invalid session')
+      console.log('Push from user:', session.userId, 'store:', storeId)
+    }
+  },
+
+  onPull: async (message, context) => {
+    const { headers } = context
+    const cookie = headers?.get('cookie')
+    if (cookie != null) {
+      const sessionToken = parseCookie(cookie, 'session_token')
+      const session = await getSessionFromToken(sessionToken)
+      if (session == null) throw new Error('Invalid session')
+    }
+  },
+}) {}
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  validatePayload: async (_payload, context) => {
+    const { headers } = context
+    const cookie = headers.get('cookie')
+    if (cookie != null) {
+      const sessionToken = parseCookie(cookie, 'session_token')
+      const session = await getSessionFromToken(sessionToken)
+      if (session == null) throw new Error('Unauthorized: Invalid session')
+    }
+  },
+  enableCORS: true,
+})
+```
+
+Headers are stored in the WebSocket attachment during connection upgrade and survive hibernation, so they remain available in `onPush` and `onPull` callbacks throughout the connection lifetime.
+
+### Custom header extraction
+
+For more control over which headers are forwarded, pass a function to `forwardHeaders`:
+
+```typescript
+export class SyncBackendDO extends makeDurableObject({
+  forwardHeaders: (request) => ({
+    'x-user-id': request.headers.get('x-user-id') ?? '',
+    'x-session': request.headers.get('cookie')?.split('session=')[1]?.split(';')[0] ?? '',
+  }),
+  // ...
+}) {}
+```
+
+## Authorization
+
+### Validating in both the worker and the Durable Object
+
+Treat `syncPayload` as untrusted input. Validate the token in `validatePayload` (which runs once per connection at the Worker level) and then repeat the same verification inside the Durable Object's `onPush` before trusting per-push metadata.
+
+```typescript
+import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+import type { SyncMessage } from '@livestore/sync-cf/common'
+import { verifyJwt } from './verify-jwt.ts'
+
+type SyncPayload = { authToken?: string; userId?: string }
+
+type AuthorizedSession = {
+  authToken: string
+  userId: string
+}
+
+const ensureAuthorized = (payload: unknown): AuthorizedSession => {
+  if (payload === undefined || payload === null || typeof payload !== 'object') {
+    throw new Error('Missing auth payload')
+  }
+  const { authToken, userId } = payload as SyncPayload
+  if (authToken == null) throw new Error('Missing auth token')
+  const claims = verifyJwt(authToken)
+  if (claims.sub == null) throw new Error('Token missing subject claim')
+  if (userId !== undefined && userId !== claims.sub) throw new Error('Payload userId mismatch')
+  return { authToken, userId: claims.sub }
+}
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  validatePayload: (payload) => {
+    ensureAuthorized(payload)
+  },
+})
+
+export class SyncBackendDO extends makeDurableObject({
+  onPush: async (message: SyncMessage.PushRequest, { payload }) => {
+    const { userId } = ensureAuthorized(payload)
+    await ensureTenantAccess(userId, message.batch)
+  },
+}) {}
+```
+
+<Warning>
+`validatePayload` runs once per WebSocket connection. For per-push authorization (checking that a specific user can write specific events), add verification inside `onPush` as well. Do not rely solely on the connection-level check.
+</Warning>
+
+The HTTP transport does not forward payloads today. If you need per-request authorization with HTTP transport, embed the necessary context directly in the event payloads or switch to WebSocket/DO-RPC transport.
+
+### Client identity vs user identity
+
+LiveStore's `clientId` identifies a client instance and is automatically managed by the framework. User identity is a separate, application-level concept.
+
+<AccordionGroup>
+  <Accordion title="clientId">
+    Automatically assigned per client instance. Useful for sync coordination but not for user-level authorization.
+  </Accordion>
+  <Accordion title="User identity">
+    Managed by your application. Pass user identity through `syncPayload` for connection-level auth, and include user IDs in event payloads for per-event attribution.
+  </Accordion>
+</AccordionGroup>
+
+User identification and semantic data (such as `userId` on an event) should live in event payloads and application state, not solely in the sync payload.
+
+## Encryption
+
+### Current state
+
+LiveStore does not yet have built-in encryption support. See [this issue](https://github.com/livestorejs/livestore/issues/70) for the roadmap.
+
+### Encrypting event payloads yourself
+
+You can implement encryption today by applying a custom Effect Schema transformation to your event definitions. The transformation encrypts the payload before the event is written to the log and decrypts it when the event is read back.
+
+```typescript
+import { Schema } from '@livestore/livestore'
+
+// Example: wrap a schema with symmetric encryption
+const encryptedString = Schema.transform(
+  Schema.String,
+  Schema.String,
+  {
+    decode: (cipher) => decrypt(cipher, KEY),
+    encode: (plain) => encrypt(plain, KEY),
+  }
+)
+
+const events = {
+  messageCreated: Events.synced({
+    name: 'v1.MessageCreated',
+    schema: Schema.Struct({
+      id: Schema.String,
+      body: encryptedString, // encrypted at rest and in transit
+    }),
+  }),
+}
+```
+
+### Key management considerations
+
+When rolling your own encryption:
+
+- **Do not hardcode keys** in your application bundle. Use environment variables or a key management service.
+- **Per-user or per-workspace keys** limit the blast radius of a compromised key. If one key is exposed, only that user's or workspace's data is at risk.
+- **Key rotation** requires re-encrypting existing events in the log. Plan for this if you need long-term key hygiene.
+- **End-to-end encryption** (where the server never sees plaintext) means the server cannot index, search, or inspect event payloads. Design your sync backend accordingly.

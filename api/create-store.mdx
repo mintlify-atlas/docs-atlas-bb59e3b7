@@ -1,0 +1,486 @@
+---
+title: createStore
+description: Create and manage LiveStore Store instances with createStore, createStorePromise, StoreRegistry, and the Store API.
+---
+
+The `Store` is the central interface to a LiveStore database. It provides reactive queries, event commits, and sync. You can create a store imperatively with `createStorePromise`, inside an Effect with `createStore`, or through a `StoreRegistry` for managed lifecycle in framework applications.
+
+## `createStorePromise`
+
+Creates a `Store` and returns a `Promise` that resolves once the store has booted.
+
+```typescript
+const createStorePromise: <
+  TSchema extends LiveStoreSchema,
+  TContext = {},
+  TSyncPayloadSchema extends Schema.Schema<any> = typeof Schema.JsonValue,
+>(
+  options: CreateStoreOptionsPromise<TSchema, TContext, TSyncPayloadSchema>,
+) => Promise<Store<TSchema, TContext>>
+```
+
+```typescript
+import { makeAdapter } from '@livestore/adapter-node'
+import { createStorePromise } from '@livestore/livestore'
+import { schema } from './schema.ts'
+
+const adapter = makeAdapter({ storage: { type: 'fs' } })
+
+const store = await createStorePromise({
+  schema,
+  adapter,
+  storeId: 'my-app',
+})
+```
+
+### `CreateStoreOptionsPromise`
+
+Extends `CreateStoreOptions` with two additional fields:
+
+<ParamField body="signal" type="AbortSignal">
+  An `AbortSignal` that, when aborted, shuts down the store by closing its lifetime scope.
+</ParamField>
+
+<ParamField body="otelOptions" type="Partial<OtelOptions>">
+  OpenTelemetry configuration for the root span context used during store boot.
+</ParamField>
+
+---
+
+## `createStore`
+
+The Effect-based variant. Returns an `Effect` that yields a `Store`, scoped to the provided `Scope`. Prefer this when composing stores inside Effect services or layers.
+
+```typescript
+const createStore: <
+  TSchema extends LiveStoreSchema,
+  TContext = {},
+  TSyncPayloadSchema extends Schema.Schema<any> = typeof Schema.JsonValue,
+>(
+  options: CreateStoreOptions<TSchema, TContext, TSyncPayloadSchema>,
+) => Effect.Effect<Store<TSchema, TContext>, UnknownError, Scope.Scope | OtelTracer.OtelTracer>
+```
+
+---
+
+## `CreateStoreOptions`
+
+All fields accepted by `createStore` (and therefore by `createStorePromise`).
+
+<ParamField body="schema" type="LiveStoreSchema" required>
+  The LiveStore schema defining tables, events, and materializers. Build this with `makeSchema()`.
+</ParamField>
+
+<ParamField body="adapter" type="Adapter" required>
+  The adapter used for storage and synchronization (e.g., `@livestore/adapter-web`, `@livestore/adapter-node`).
+</ParamField>
+
+<ParamField body="storeId" type="string" required>
+  Stable identifier for this store instance. Used for persistence and multi-tenancy isolation.
+
+  - Only alphanumeric characters, underscores (`_`), and hyphens (`-`) are allowed. Must match `/^[a-zA-Z0-9_-]+$/`.
+  - Use a globally unique ID to prevent collisions (e.g., `nanoid()`).
+  - Prefix with a namespace to make debugging easier (e.g., `app-root`, `workspace-abc123`).
+</ParamField>
+
+<ParamField body="context" type="TContext" default="{}">
+  User-defined context attached to the store. Useful for dependency injection—accessible at `store.context`.
+</ParamField>
+
+<ParamField body="boot" type="(store, ctx) => Effect | Promise | void">
+  Optional async callback invoked after the store has initialized but before `createStorePromise` resolves. Use it to seed initial data or run startup migrations.
+
+  ```typescript
+  boot: async (store, { migrationsReport }) => {
+    if (migrationsReport.migrations.length > 0) {
+      store.commit(events.appInitialized({ version: 1 }))
+    }
+  }
+  ```
+</ParamField>
+
+<ParamField body="batchUpdates" type="(run: () => void) => void">
+  Wraps reactive notifications in a batching function to avoid redundant re-renders. In React applications pass `unstable_batchedUpdates` from `react-dom` or `react-native`.
+
+  ```typescript
+  import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+  // ...
+  batchUpdates,
+  ```
+</ParamField>
+
+<ParamField body="disableDevtools" type="boolean | 'auto'" default="'auto'">
+  Controls whether the LiveStore DevTools extension is connected. `'auto'` enables DevTools in development environments only.
+</ParamField>
+
+<ParamField body="onBootStatus" type="(status: BootStatus) => void">
+  Callback invoked at each stage of the boot sequence. Useful for displaying progress indicators.
+</ParamField>
+
+<ParamField body="syncPayloadSchema" type="Schema.Schema<any>">
+  Effect Schema describing the payload sent to the sync backend when connecting. Defaults to `Schema.JsonValue` (untyped). Provide a typed schema for end-to-end type safety.
+
+  ```typescript
+  const SyncPayload = Schema.Struct({ authToken: Schema.String })
+  // ...
+  syncPayloadSchema: SyncPayload,
+  syncPayload: { authToken: userToken },
+  ```
+</ParamField>
+
+<ParamField body="syncPayload" type="Schema.Schema.Type<TSyncPayloadSchema>">
+  The payload sent to the sync backend. Its type is inferred from `syncPayloadSchema`.
+</ParamField>
+
+<ParamField body="confirmUnsavedChanges" type="boolean" default="true">
+  When `true`, registers a `beforeunload` listener to warn users about unsaved changes. Web adapter only.
+</ParamField>
+
+<ParamField body="shutdownDeferred" type="ShutdownDeferred">
+  An Effect `Deferred` that is completed when the store shuts down. Use `makeShutdownDeferred()` to create one and await it to block until shutdown completes.
+</ParamField>
+
+<ParamField body="params" type="object">
+  Advanced tuning options.
+
+  <Expandable title="params properties">
+    <ParamField body="params.leaderPushBatchSize" type="number" default="100">
+      Maximum events pushed to the leader thread per write batch.
+    </ParamField>
+    <ParamField body="params.eventQueryBatchSize" type="number" default="100">
+      Chunk size used when replaying confirmed events from the eventlog.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+## `Store` instance methods
+
+Once you have a `Store`, use these methods to interact with it.
+
+### `store.query(queryable)`
+
+Synchronously reads the current value of a query, signal, or computed without creating a reactive subscription.
+
+```typescript
+store.query: <TResult>(
+  query:
+    | Queryable<TResult>
+    | { query: string; bindValues: Bindable; schema?: Schema.Schema<TResult> },
+  options?: { otelContext?: otel.Context },
+) => TResult
+```
+
+```typescript
+// Query builder
+const todos = store.query(tables.todos.where({ completed: false }))
+
+// Raw SQL
+const counts = store.query({
+  query: 'SELECT COUNT(*) as n FROM todos',
+  bindValues: {},
+  schema: Schema.Array(Schema.Struct({ n: Schema.Number })),
+})
+
+// LiveQueryDef
+const todos$ = queryDb(tables.todos.orderBy('createdAt', 'desc'))
+const todos = store.query(todos$)
+```
+
+### `store.subscribe(queryable, onUpdate, options?)`
+
+Subscribes to a reactive query. Calls `onUpdate` immediately with the current value and again whenever the result changes.
+
+Returns an `Unsubscribe` function when `onUpdate` is provided. When called without a callback it returns an `AsyncIterable<TResult>`.
+
+```typescript
+// With callback
+const unsubscribe = store.subscribe(todos$, (todos) => {
+  console.log('todos updated:', todos)
+})
+
+// Stop receiving updates
+unsubscribe()
+
+// As async iterable
+for await (const todos of store.subscribe(todos$)) {
+  console.log(todos)
+}
+```
+
+<ParamField body="options.label" type="string">
+  Human-readable label shown in DevTools for this subscription.
+</ParamField>
+
+<ParamField body="options.skipInitialRun" type="boolean">
+  When `true`, skips calling `onUpdate` for the initial value. The subscription still registers its reactive dependencies.
+</ParamField>
+
+<ParamField body="options.onSubscribe" type="(query$: LiveQuery<TResult>) => void">
+  Callback invoked when the subscription is established, receiving the live query instance.
+</ParamField>
+
+<ParamField body="options.onUnsubsubscribe" type="() => void">
+  Callback invoked when the subscription is terminated.
+</ParamField>
+
+### `store.commit(...events)`
+
+Commits one or more events to the store. Events are immediately materialized into the local SQLite database and asynchronously synced to other clients.
+
+```typescript
+store.commit: {
+  // One or more events
+  <TCommitArg extends ReadonlyArray<LiveStoreEvent.Input.ForSchema<TSchema>>>(
+    ...list: TCommitArg
+  ): void
+  // Transaction function
+  (txn: (...list: TCommitArg) => void): void
+  // With options
+  (options: StoreCommitOptions, ...list: TCommitArg): void
+}
+```
+
+```typescript
+// Single event
+store.commit(events.todoCreated({ id: nanoid(), text: 'Buy milk' }))
+
+// Multiple events in one transaction
+store.commit(
+  events.todoCreated({ id: nanoid(), text: 'Buy milk' }),
+  events.todoCompleted({ id: existingId }),
+)
+
+// Transaction function for conditional commits
+store.commit((commit) => {
+  const id = nanoid()
+  if (Math.random() > 0.5) {
+    commit(events.todoCreated({ id, text: 'Random todo' }))
+  }
+})
+
+// Batch commits without triggering a reactive refresh per event
+for (const item of largeBatch) {
+  store.commit({ skipRefresh: true }, events.todoCreated({ id: item.id, text: item.text }))
+}
+store.manualRefresh()
+```
+
+### `store.events(options?)`
+
+Returns an `AsyncIterable` of events from the eventlog. Only events confirmed by the sync backend are included.
+
+```typescript
+store.events: (options?: StoreEventsOptions<TSchema>) => AsyncIterable<LiveStoreEvent.Client.ForSchema<TSchema>>
+```
+
+```typescript
+// Stream all events
+for await (const event of store.events()) {
+  console.log(event)
+}
+
+// Filter by event type
+for await (const event of store.events({ filter: ['v1.TodoCreated'] })) {
+  console.log('created:', event)
+}
+```
+
+<ParamField body="options.filter" type="ReadonlyArray<keyof TSchema['_EventDefMapType']>">
+  Only emit events of the given names. Defaults to all event types.
+</ParamField>
+
+<ParamField body="options.since" type="EventSequenceNumber">
+  Start streaming from this event sequence number.
+</ParamField>
+
+<ParamField body="options.until" type="EventSequenceNumber">
+  Stop the stream once this event is reached.
+</ParamField>
+
+<ParamField body="options.batchSize" type="number" default="100">
+  Maximum events fetched per database query. Maximum allowed value is 1000.
+</ParamField>
+
+### `store.shutdown()`
+
+Shuts down the store and closes the client session. Returns an `Effect`.
+
+```typescript
+store.shutdown: (cause?: Cause.Cause<UnknownError | MaterializeError>) => Effect.Effect<void>
+```
+
+### `store.shutdownPromise()`
+
+Promise-based shutdown. Awaits complete cleanup.
+
+```typescript
+await store.shutdownPromise()
+```
+
+### `store.syncStatus()`
+
+Returns the current sync state between the local session and the leader thread.
+
+```typescript
+store.syncStatus: () => SyncStatus
+
+type SyncStatus = {
+  localHead: string      // e.g. "e5.2"
+  upstreamHead: string   // e.g. "e3"
+  pendingCount: number
+  isSynced: boolean
+}
+```
+
+### `store.subscribeSyncStatus(onUpdate)`
+
+Subscribes to sync status changes. Invokes `onUpdate` immediately and on every state change.
+
+```typescript
+const unsubscribe = store.subscribeSyncStatus((status) => {
+  console.log(status.isSynced ? 'Synced' : `${status.pendingCount} pending`)
+})
+```
+
+### `store.setSignal(signalDef, value)`
+
+Sets the value of a signal. Accepts a new value or a function that receives the previous value.
+
+```typescript
+store.setSignal: <T>(signalDef: SignalDef<T>, value: T | ((prev: T) => T)) => void
+```
+
+```typescript
+const count$ = signal(0, { label: 'count$' })
+
+store.setSignal(count$, 42)
+store.setSignal(count$, (prev) => prev + 1)
+```
+
+---
+
+## `StoreRegistry`
+
+`StoreRegistry` manages store lifecycle for framework integrations. It caches stores by `storeId`, reference-counts them, and disposes them after `unusedCacheTime` milliseconds when they have no active consumers.
+
+```typescript
+const registry = new StoreRegistry({
+  defaultOptions: {
+    batchUpdates,
+    unusedCacheTime: 30_000,
+  },
+})
+```
+
+### `registry.getOrLoadPromise(options)`
+
+Returns the store synchronously if already cached, or a `Promise` if it is loading. Concurrent calls with the same `storeId` receive the same `Promise` reference.
+
+```typescript
+const storeOrPromise = registry.getOrLoadPromise({ schema, adapter, storeId: 'workspace-abc' })
+```
+
+### `registry.getOrLoad(options)`
+
+Effect-based variant. Yields the store scoped to the caller's `Scope`.
+
+### `registry.retain(options)`
+
+Keeps the store alive regardless of component lifecycle. Returns a `release` function.
+
+```typescript
+const release = registry.retain({ schema, adapter, storeId: 'workspace-abc' })
+// Later:
+release()
+```
+
+### `registry.preload(options)`
+
+Fire-and-forget store preloading to warm the cache before it is needed.
+
+```typescript
+await registry.preload({ schema, adapter, storeId: 'workspace-abc' })
+```
+
+### `registry.dispose()`
+
+Disposes the registry and all managed stores, releasing database connections, WebSocket connections, and web workers.
+
+---
+
+## `storeOptions`
+
+A helper that returns its argument unchanged while enabling TypeScript's excess property checking. Use it to define reusable store configurations that can be shared across `useStore()`, `preload()`, and `getOrLoad()`.
+
+```typescript
+export const issueStoreOptions = (issueId: string) =>
+  storeOptions({
+    storeId: `issue-${issueId}`,
+    schema,
+    adapter,
+    unusedCacheTime: 30_000,
+  })
+
+// In a component
+const store = useStore(issueStoreOptions(issueId))
+
+// In a route loader
+registry.preload(issueStoreOptions(issueId))
+```
+
+---
+
+## Effect integration: `makeStoreContext`
+
+For Effect-based applications, create a typed store context that preserves your schema types:
+
+```typescript
+import { Store } from '@livestore/livestore/effect'
+import { schema } from './schema.ts'
+
+// Create a typed context tag
+export const TodoStore = Store.Tag(schema, 'todos')
+
+// Create a layer that initializes the store
+const adapter = makeAdapter({ storage: { type: 'fs' } })
+export const TodoStoreLayer = TodoStore.layer({ adapter })
+```
+
+The returned `StoreContext` exposes:
+
+<ResponseField name="Tag" type="Context.Tag">
+  Context tag for dependency injection. Yield it in Effect code to access `{ store }`.
+</ResponseField>
+
+<ResponseField name="layer" type="(options) => Layer">
+  Creates a layer that boots the store and provides it to the context.
+</ResponseField>
+
+<ResponseField name="DeferredTag" type="Context.Tag">
+  Tag for async initialization patterns where the store is provided later.
+</ResponseField>
+
+```typescript
+// Access the store with full type safety
+const todoService = Effect.gen(function* () {
+  const { store } = yield* TodoStore
+
+  const todos = store.query(tables.todos.select())
+  store.commit(events.todoCreated({ id: '1', text: 'Buy milk' }))
+
+  return todos
+})
+
+// Or use static accessors
+const todoServiceAlt = Effect.gen(function* () {
+  const todos = yield* TodoStore.query(tables.todos.select())
+  yield* TodoStore.commit(events.todoCreated({ id: '1', text: 'Buy milk' }))
+  return todos
+})
+```
+
+<Note>
+  `makeStoreContext()` is the recommended way to use LiveStore with Effect. It preserves full schema types, unlike the deprecated `LiveStoreContextRunning` service.
+</Note>

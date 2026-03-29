@@ -1,0 +1,249 @@
+---
+title: S2
+description: Sync LiveStore with the S2 streaming storage service using @livestore/sync-s2.
+---
+
+The `@livestore/sync-s2` package lets you sync LiveStore with [S2](https://s2.dev), a managed streaming storage service. Each LiveStore `storeId` maps to one S2 stream. Events are JSON-encoded and appended as S2 records. Live pull is delivered over Server-Sent Events (SSE).
+
+- **Protocol**: HTTP push/pull, live pull via SSE
+- **Live pull**: supported (SSE tail)
+
+## Architecture
+
+```
+Browser (LiveStore Client)
+       │  GET (pull) / POST (push) / HEAD (ping)
+       ▼
+Your API Proxy (/api/s2)
+       │  Authenticated requests
+       ▼
+S2 Cloud (*.s2.dev)
+```
+
+The API proxy handles:
+- **Authentication** — adds your S2 access token to requests
+- **Stream management** — creates basins and streams as needed
+- **Request translation** — converts LiveStore sync operations to S2 API calls
+- **Business logic** — rate limiting, logging, or any app-specific logic
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/sync-s2
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/sync-s2
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/sync-s2
+    ```
+  </Tab>
+</Tabs>
+
+## Client setup
+
+Point `makeSyncBackend` at your API proxy endpoint:
+
+```typescript store.ts
+import { makeSyncBackend } from '@livestore/sync-s2'
+
+const _backend = makeSyncBackend({
+  endpoint: '/api/s2', // Your API proxy endpoint
+  // more options...
+})
+```
+
+You can also split push, pull, and ping across separate endpoints:
+
+```typescript store.ts
+import { makeSyncBackend } from '@livestore/sync-s2'
+
+const backend = makeSyncBackend({
+  endpoint: {
+    push: '/api/s2/push',
+    pull: '/api/s2/pull',
+    ping: '/api/s2/ping',
+  },
+  ping: {
+    enabled: true,
+    requestTimeout: 10_000,
+    requestInterval: 10_000,
+  },
+  retry: {
+    // Optional: custom retry schedule for pulls and pushes
+  },
+})
+```
+
+## API proxy implementation
+
+Your server needs three endpoints: `HEAD` (ping), `GET` (pull), and `POST` (push). The `@livestore/sync-s2` package exports helper functions to handle the S2-specific details.
+
+```typescript api/s2/route.ts
+import { Schema } from '@livestore/livestore'
+import * as S2 from '@livestore/sync-s2'
+import * as S2Helpers from '@livestore/sync-s2/s2-proxy-helpers'
+
+// Configure S2 connection
+const s2Config: S2Helpers.S2Config = {
+  basin: process.env.S2_BASIN ?? 'your-basin',
+  token: process.env.S2_ACCESS_TOKEN!, // Your S2 access token
+}
+
+// HEAD /api/s2 - Health check/ping
+export const HEAD = async () => {
+  return new Response(null, { status: 200 })
+}
+
+// GET /api/s2 - Pull events
+export const GET = async (request: Request) => {
+  const url = new URL(request.url)
+  const args = S2.decodePullArgsFromSearchParams(url.searchParams)
+  const streamName = S2.makeS2StreamName(args.storeId)
+
+  // Ensure basin and stream exist
+  await S2Helpers.ensureBasin(s2Config)
+  await S2Helpers.ensureStream(s2Config, streamName)
+
+  // Build request with appropriate headers and URL
+  // Note: buildPullRequest handles cursor+1 conversion internally
+  const { url: pullUrl, headers } = S2Helpers.buildPullRequest({ config: s2Config, args })
+
+  const res = await fetch(pullUrl, { headers })
+
+  // For live pulls (SSE), proxy the response
+  if (args.live === true) {
+    if (res.ok === false) {
+      return S2Helpers.sseKeepAliveResponse()
+    }
+    return new Response(res.body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  }
+
+  // For regular pulls
+  if (res.ok === false) {
+    return S2Helpers.emptyBatchResponse()
+  }
+
+  const batch = await res.text()
+  return new Response(batch, {
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+// POST /api/s2 - Push events
+export const POST = async (request: Request) => {
+  const requestBody = await request.json()
+  const parsed = Schema.decodeUnknownSync(S2.ApiSchema.PushPayload)(requestBody)
+  const streamName = S2.makeS2StreamName(parsed.storeId)
+
+  // Ensure basin and stream exist
+  await S2Helpers.ensureBasin(s2Config)
+  await S2Helpers.ensureStream(s2Config, streamName)
+
+  // Build push request with proper formatting
+  const pushRequests = S2Helpers.buildPushRequests({
+    config: s2Config,
+    storeId: parsed.storeId,
+    batch: parsed.batch,
+  })
+
+  for (const pushRequest of pushRequests) {
+    const res = await fetch(pushRequest.url, {
+      method: 'POST',
+      headers: pushRequest.headers,
+      body: pushRequest.body,
+    })
+
+    if (res.ok === false) {
+      return S2Helpers.errorResponse('Push failed', 500)
+    }
+  }
+
+  return S2Helpers.successResponse()
+}
+```
+
+### Proxy helper reference
+
+The `@livestore/sync-s2/s2-proxy-helpers` module provides:
+
+| Helper | Description |
+|--------|-------------|
+| `ensureBasin(config)` | Creates the S2 basin if it does not exist |
+| `ensureStream(config, stream)` | Creates the S2 stream if it does not exist |
+| `buildPullRequest({ config, args })` | Returns `{ url, headers }` for a pull request to S2 |
+| `buildPushRequests({ config, storeId, batch })` | Returns an array of push requests (handles batching limits) |
+| `emptyBatchResponse()` | Returns a fallback empty batch response |
+| `sseKeepAliveResponse()` | Returns a keep-alive SSE response |
+| `successResponse()` | Returns `{ success: true }` JSON response |
+| `errorResponse(message, status?)` | Returns an error JSON response |
+
+## Live pull (SSE)
+
+When `live: true` is passed to `pull`, the client connects to the proxy and receives a Server-Sent Events stream. The proxy forwards the SSE stream from S2.
+
+SSE event types the client handles:
+
+| Event | Behaviour |
+|-------|-----------|
+| `batch` | Parses the data as an S2 `ReadBatch` and emits events |
+| `ping` | Ignored; keeps the connection alive |
+| `error` | Mapped to `UnknownError` |
+
+## Data storage
+
+### LiveStore → S2 mapping
+
+- **Store to stream**: each `storeId` maps to one S2 stream. The stream name is derived from the `storeId` after sanitization.
+- **Event encoding**: LiveStore events are JSON-serialized and stored as the `body` field of S2 records.
+
+Each record body looks like:
+
+```json
+{
+  "body": "{\"name\":\"todo/create\",\"args\":{...},\"seqNum\":42,\"parentSeqNum\":41,...}"
+}
+```
+
+### Sequence number systems
+
+LiveStore and S2 maintain **independent** sequence numbering:
+
+- **LiveStore `seqNum`** — stored inside the JSON event payload. Used for logical event ordering within LiveStore.
+- **S2 `seq_num`** — assigned by S2 to each record. Used only for stream positioning when reading.
+
+Both start at 0 and often align numerically, but this is coincidental. The sync provider never couples the two systems together.
+
+<Warning>
+  Do not manipulate S2 streams directly. Always interact through LiveStore's sync provider to preserve event encoding, sequence number integrity, and cursor management. Direct stream manipulation may corrupt the event log.
+</Warning>
+
+### Cursor semantics
+
+The cursor represents the **last processed record**:
+- The cursor holds the last S2 `seq_num` seen.
+- S2's `seq_num` parameter expects where to start reading (inclusive).
+- `buildPullRequest` handles the `+1` conversion: `seq_num = cursor + 1`.
+- When starting from the beginning, cursor is `'from-start'`, which maps to `seq_num = 0`.
+
+## Use cases
+
+S2 is a good fit when you want:
+
+- **Durable event streaming** without managing your own database
+- **Real-time delivery** via SSE without long-polling
+- **Simple scaling** — S2 handles stream storage and ordering
+- **Bring-your-own proxy** — full control over auth and business logic in your own server
+
+<Tip>
+  S2 also supports a self-hosted open-source variant called [s2-lite](https://github.com/s2-streamstore/s2-lite). Set `lite: true` in your `S2Config` to enable header-based basin routing instead of subdomain routing.
+</Tip>

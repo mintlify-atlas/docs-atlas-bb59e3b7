@@ -1,0 +1,279 @@
+---
+title: "Quickstart: Vue"
+description: "Add LiveStore to a Vue 3 app with persisted SQLite state and reactive composables."
+---
+
+<Warning>
+  Vue integration is in beta and maintained in a separate repository:
+  [slashv/vue-livestore](https://github.com/slashv/vue-livestore). Report
+  issues and contributions there.
+</Warning>
+
+<Info>
+  LiveStore requires Node.js 18 or higher. Bun 1.2+ or pnpm are recommended for
+  the simplest dependency setup.
+</Info>
+
+<Steps>
+
+<Step title="Install packages">
+
+Install LiveStore, the web adapter, and the Vue integration:
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/peer-deps vue-livestore vue
+```
+
+```bash pnpm
+pnpm add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/peer-deps vue-livestore vue
+```
+
+```bash yarn
+yarn add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/peer-deps vue-livestore vue
+```
+
+```bash bun
+bun add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/peer-deps vue-livestore vue
+```
+
+</CodeGroup>
+
+Also install Vite plugins:
+
+<CodeGroup>
+
+```bash npm
+npm install --save-dev @vitejs/plugin-vue vite-plugin-vue-devtools @livestore/devtools-vite
+```
+
+```bash pnpm
+pnpm add -D @vitejs/plugin-vue vite-plugin-vue-devtools @livestore/devtools-vite
+```
+
+```bash yarn
+yarn add -D @vitejs/plugin-vue vite-plugin-vue-devtools @livestore/devtools-vite
+```
+
+```bash bun
+bun add -d @vitejs/plugin-vue vite-plugin-vue-devtools @livestore/devtools-vite
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Configure Vite">
+
+Update your `vite.config.ts`:
+
+```typescript vite.config.ts
+import vue from '@vitejs/plugin-vue'
+import { defineConfig } from 'vite'
+import vueDevTools from 'vite-plugin-vue-devtools'
+
+import { livestoreDevtoolsPlugin } from '@livestore/devtools-vite'
+
+export default defineConfig({
+  plugins: [
+    vue(),
+    vueDevTools(),
+    livestoreDevtoolsPlugin({ schemaPath: './src/livestore/schema.ts' }),
+  ],
+  worker: { format: 'es' },
+})
+```
+
+<Note>
+  The `worker: { format: 'es' }` setting is required so that Vite bundles the
+  LiveStore web worker as an ES module.
+</Note>
+
+</Step>
+
+<Step title="Create the web worker">
+
+Create `src/livestore/livestore.worker.ts`. This file runs in a dedicated worker thread and manages the SQLite database.
+
+```typescript src/livestore/livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+
+import { schema } from './schema.ts'
+
+makeWorker({ schema })
+```
+
+</Step>
+
+<Step title="Define your schema">
+
+Create `src/livestore/schema.ts`:
+
+```typescript src/livestore/schema.ts
+import { Events, makeSchema, Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+// SQLite tables hold derived state
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+      deletedAt: State.SQLite.integer({ nullable: true, schema: Schema.DateFromNumber }),
+    },
+  }),
+  // Client documents store local-only state (e.g. form input)
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({
+      newTodoText: Schema.String,
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+    default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+  }),
+}
+
+// Events describe all data changes
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoUncompleted: Events.synced({
+    name: 'v1.TodoUncompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Date }),
+  }),
+  uiStateSet: tables.uiState.set,
+}
+
+// Materializers map events onto table mutations
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+  'v1.TodoUncompleted': ({ id }) => tables.todos.update({ completed: false }).where({ id }),
+  'v1.TodoDeleted': ({ id, deletedAt }) => tables.todos.update({ deletedAt }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+
+export const schema = makeSchema({ events, state })
+```
+
+</Step>
+
+<Step title="Set up LiveStoreProvider">
+
+Wrap your app root with `<LiveStoreProvider>` from `vue-livestore`. Configure the adapter and schema in the same component.
+
+```vue src/App.vue
+<script setup lang="ts">
+import { makePersistedAdapter } from '@livestore/adapter-web'
+import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+import LiveStoreWorker from './livestore/livestore.worker.ts?worker'
+import { schema } from './livestore/schema.ts'
+
+const adapter = makePersistedAdapter({
+  storage: { type: 'opfs' },
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+})
+
+const storeOptions = {
+  schema,
+  adapter,
+  storeId: 'app-root',
+}
+</script>
+
+<template>
+  <LiveStoreProvider :options="storeOptions">
+    <template #loading>
+      <div>Loading LiveStore...</div>
+    </template>
+    <slot />
+  </LiveStoreProvider>
+</template>
+```
+
+The `?worker` and `?sharedworker` suffixes tell Vite to bundle these imports as worker modules.
+
+</Step>
+
+<Step title="Commit events">
+
+Use the `useStore` composable from `vue-livestore` to access the store and commit events:
+
+```vue src/components/AddTodo.vue
+<script setup lang="ts">
+import { ref } from 'vue'
+import { useStore } from 'vue-livestore'
+
+import { events } from '../livestore/schema.ts'
+
+const { store } = useStore()
+
+const newTodoText = ref('')
+
+const createTodo = () => {
+  store.commit(events.todoCreated({ id: crypto.randomUUID(), text: newTodoText.value }))
+  newTodoText.value = ''
+}
+</script>
+
+<template>
+  <div>
+    <input v-model="newTodoText" placeholder="What needs to be done?" />
+    <button @click="createTodo">Add</button>
+  </div>
+</template>
+```
+
+</Step>
+
+<Step title="Query data">
+
+Use `queryDb` from `@livestore/livestore` to define a query, then execute it with the `useQuery` composable from `vue-livestore`. Queries are reactive: the component updates automatically whenever the underlying data changes.
+
+```vue src/components/TodoList.vue
+<script setup lang="ts">
+import { queryDb } from '@livestore/livestore'
+import { useQuery } from 'vue-livestore'
+
+import { tables } from '../livestore/schema.ts'
+
+const todos$ = queryDb(
+  () => tables.todos.where({ deletedAt: null, completed: false }),
+  { label: 'todos' },
+)
+
+const todos = useQuery(todos$)
+</script>
+
+<template>
+  <ul>
+    <li v-for="todo in todos" :key="todo.id">
+      {{ todo.text }}
+    </li>
+  </ul>
+</template>
+```
+
+</Step>
+
+</Steps>
+
+<Tip>
+  For a complete working example, see the
+  [playground](https://github.com/slashv/vue-livestore/tree/main/playground)
+  in the vue-livestore repository.
+</Tip>

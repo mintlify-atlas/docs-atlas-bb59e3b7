@@ -1,0 +1,198 @@
+---
+title: How LiveStore works
+description: A deep dive into the LiveStore architecture — platform adapters, the event flow from commit to UI, the leader thread model, sync architecture, and conflict resolution.
+---
+
+LiveStore uses event sourcing to sync events across clients and materialize state into a local, reactive SQLite database. This page explains the architecture in depth.
+
+## The big picture
+
+When a user performs an action in your app, LiveStore:
+
+1. Commits an immutable **event** describing what happened
+2. Persists the event to the local **eventlog**
+3. Runs **materializers** to update the local SQLite database
+4. Notifies the **reactivity system**, which re-renders subscribed UI components
+5. Pushes the event to the **sync backend** so other clients receive it
+
+All of this happens in milliseconds. Reads from SQLite are synchronous and instant because the database lives in-memory on the main thread.
+
+---
+
+## Platform adapters
+
+LiveStore is designed to run on multiple platforms. A **platform adapter** abstracts over the runtime environment and is responsible for:
+
+- Spawning and managing the leader thread (Web Worker, background thread, or in-process)
+- Providing access to persistent storage (SQLite file, IndexedDB-backed storage)
+- Wiring up the communication channel between the client session thread and the leader thread
+
+<CardGroup cols={3}>
+  <Card title="Web adapter" icon="browser" href="/integrations/platform-adapters">
+    `@livestore/adapter-web` — runs in browsers. The leader thread runs in a Web Worker. Supports both in-memory and persisted SQLite.
+  </Card>
+  <Card title="Expo adapter" icon="mobile" href="/integrations/platform-adapters">
+    `@livestore/adapter-expo` — runs on iOS and Android via Expo. Uses the device's native SQLite for persistence.
+  </Card>
+  <Card title="Node adapter" icon="server" href="/integrations/platform-adapters">
+    `@livestore/adapter-node` — runs in Node.js for server-side apps, CLI tools, and AI agents.
+  </Card>
+</CardGroup>
+
+---
+
+## Client-side event flow
+
+On the client, LiveStore maintains two SQLite databases and a reactivity graph:
+
+| Database | Location | Purpose |
+|---|---|---|
+| In-memory SQLite | Client session thread (main thread) | Powers the reactivity graph — synchronous, instant reads |
+| Persisted SQLite | Leader thread (Web Worker) | Durable storage across sessions, source for rematerialization |
+
+### Step-by-step: from user action to UI update
+
+<Steps>
+  <Step title="Commit an event">
+    Your application calls `store.commit(events.todoCreated({ id, text }))`. This records an immutable event — a named, typed fact about something that happened.
+  </Step>
+  <Step title="Persist to the eventlog">
+    The event is appended to the local eventlog on the leader thread. The eventlog is an ordered, append-only sequence of all synced events. It is the canonical source of truth.
+  </Step>
+  <Step title="Materialize state">
+    The leader thread runs the matching **materializer** — a pure function that translates the event into a SQLite write (insert, update, or delete). The persisted SQLite database is updated atomically with the eventlog append.
+  </Step>
+  <Step title="Propagate to the in-memory replica">
+    The state change is forwarded to the in-memory SQLite database on the client session thread (main thread). This replica is kept in sync with the persisted database.
+  </Step>
+  <Step title="Reactivity fires">
+    The reactivity system detects which `queryDb` subscriptions are affected by the changed rows. Subscribed React components (or other framework integrations) re-render with the new data — synchronously, without a loading state.
+  </Step>
+</Steps>
+
+---
+
+## Leader thread vs. client session thread
+
+The separation between the **leader thread** and the **client session thread** is central to LiveStore's performance and correctness.
+
+### Leader thread
+
+The leader thread (a Web Worker in browsers) is responsible for:
+
+- **Persisting events** to the local eventlog
+- **Running materializers** to update the persisted SQLite database
+- **Communicating with the sync backend** — pushing local events and pulling remote events
+- **Conflict resolution** — rebasing local pending events on top of incoming remote events
+
+In a browser with multiple tabs open to the same app, exactly one tab's worker is elected as the leader. Other tabs operate as followers and receive updates from the leader over a broadcast channel.
+
+### Client session thread
+
+The client session thread (usually the main thread) is responsible for:
+
+- Holding the **in-memory SQLite replica** used for all reads
+- Running the **reactivity graph** — tracking subscriptions and notifying UI components
+- Accepting `store.commit()` calls from application code and forwarding events to the leader
+
+Because reads go to in-memory SQLite on the main thread, they are synchronous and sub-millisecond. There is no async I/O on the read path.
+
+<Info>
+The platform adapter manages the leader election and thread communication automatically. You don't need to think about it for typical application development.
+</Info>
+
+---
+
+## Sync architecture
+
+LiveStore extends the local event-sourcing model globally by synchronizing the eventlog across all clients through a central sync backend.
+
+### Push/pull model
+
+Inspired by Git, LiveStore uses a **push/pull model** for event synchronization:
+
+<Steps>
+  <Step title="Local commit (optimistic)">
+    When you commit an event, it is applied to the local SQLite database immediately. The UI updates before any network round-trip — this is the optimistic update.
+  </Step>
+  <Step title="Pull before push">
+    Before pushing a local event to the sync backend, the leader pulls the latest events from the backend. This ensures the local eventlog is up to date and prevents ordering conflicts.
+  </Step>
+  <Step title="Rebase if needed">
+    If new remote events arrived while you were working, your local pending events are **rebased** on top of them. Materializers re-run in the correct global order.
+  </Step>
+  <Step title="Push to backend">
+    Once the local eventlog is consistent with the backend, the pending local events are pushed. The backend enforces a global total order.
+  </Step>
+  <Step title="Other clients pull">
+    Other connected clients are notified of new events (via WebSocket or polling). They pull, materialize, and update their UI — achieving eventual consistency.
+  </Step>
+</Steps>
+
+### Sync data flow diagram
+
+```
+Client A (leader thread)                  Sync backend
+─────────────────────────                 ─────────────
+commit event
+  → append to local eventlog
+  → materialize to local SQLite
+  → UI updates immediately (optimistic)
+  → pull latest from backend ──────────→ return new remote events (if any)
+  ← receive remote events ─────────────
+  → rebase local pending events
+  → push local events ──────────────→  persist, enforce global order
+                                        notify other clients
+                       Client B ←────  pull new events
+                                        materialize locally
+                                        UI updates
+```
+
+### Offline behavior
+
+When there is no network connectivity, `store.commit()` still works — events are committed to the local eventlog and materialized immediately. Pending events accumulate in the local eventlog. When connectivity returns, the leader thread syncs all pending events to the backend automatically.
+
+Your app requires no special offline handling code.
+
+---
+
+## Conflict resolution
+
+Concurrent operations from different clients can produce conflicting events. LiveStore resolves these via **rebase**:
+
+1. When client A's push is rejected because client B pushed first, client A pulls client B's events.
+2. Client A's local pending events are removed from the tail of the eventlog.
+3. Client B's events are appended in their globally-ordered position.
+4. Client A's pending events are re-appended after client B's events and materialized again.
+
+The default conflict strategy is **last-write-wins** at the materializer level. When two events both update the same row, the one that was materialized last (in global order) wins.
+
+For applications that require custom conflict logic — for example, merging concurrent edits to a document — you can implement custom materializer logic to detect and resolve conflicts in any way that fits your domain.
+
+<Warning>
+LiveStore's sync system is designed for small to medium concurrency: 10s to low 100s of users collaborating on the same eventlog. For higher concurrency, segment your data across multiple stores using different `storeId` values (for example, one per workspace or document).
+</Warning>
+
+---
+
+## SQLite: in-memory vs. persisted
+
+LiveStore uses two SQLite databases per client, each serving a different purpose:
+
+### In-memory SQLite (client session thread)
+
+- Lives on the main thread — no async I/O
+- Populated from the persisted database on startup, then kept in sync via incremental updates
+- Powers all reactive queries (`queryDb`, `computed`)
+- Discarded when the session ends
+
+### Persisted SQLite (leader thread)
+
+- Lives on the leader thread (Web Worker or native thread)
+- Written atomically with each eventlog append
+- Survives page refreshes and app restarts
+- Can be fully reconstructed by replaying the eventlog from scratch
+
+<Tip>
+Because state is fully derived from the eventlog, you can always rebuild a consistent SQLite database by replaying events — even after a crash or a schema migration.
+</Tip>

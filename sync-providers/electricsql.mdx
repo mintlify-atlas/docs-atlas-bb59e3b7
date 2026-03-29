@@ -1,0 +1,206 @@
+---
+title: ElectricSQL
+description: Sync LiveStore with a Postgres database via ElectricSQL using @livestore/sync-electric.
+---
+
+The `@livestore/sync-electric` package lets you sync LiveStore through an ElectricSQL server backed by Postgres. ElectricSQL streams Postgres changes to clients in real time. LiveStore events are stored in a Postgres table and delivered via Electric's shape-based sync protocol.
+
+- **Protocol**: HTTP push/pull with long-polling support
+- **Live pull**: supported (via Electric's long-polling)
+
+## Architecture
+
+```
+Browser (LiveStore Client)
+       │  GET (pull) / POST (push)
+       ▼
+Your API Proxy (/api/electric)
+       │                    │
+  Pull requests         Push events
+  (proxied)             (direct write)
+       ▼                    ▼
+Electric Server         Postgres DB
+(:30000)           ◄── (listened to by Electric)
+```
+
+The API proxy has two responsibilities:
+
+- **Pull** — proxy GET requests to the Electric server, which streams shape updates from Postgres.
+- **Push** — write events directly to Postgres (bypassing Electric). Electric then picks them up and streams them to other clients.
+
+An API proxy is required because it is where you implement authentication, rate limiting, and database initialization. You cannot expose the Electric server directly to the browser.
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/sync-electric
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/sync-electric
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/sync-electric
+    ```
+  </Tab>
+</Tabs>
+
+## Client setup
+
+Point `makeSyncBackend` at your API proxy endpoint:
+
+```typescript store.ts
+import { makeSyncBackend } from '@livestore/sync-electric'
+
+const _backend = makeSyncBackend({
+  endpoint: '/api/electric', // Your API proxy endpoint
+  ping: { enabled: true },
+})
+```
+
+You can also split push, pull, and ping across separate endpoints:
+
+```typescript store.ts
+import { makeSyncBackend } from '@livestore/sync-electric'
+
+const backend = makeSyncBackend({
+  endpoint: {
+    push: '/api/push-event',
+    pull: '/api/pull-events',
+    ping: '/api/ping',
+  },
+  ping: {
+    enabled: true,
+    requestInterval: 15_000, // 15 seconds
+  },
+})
+```
+
+## API proxy implementation
+
+Your server needs two endpoints: `GET` (pull) and `POST` (push).
+
+```typescript api/electric/route.ts
+import { Schema } from '@livestore/livestore'
+import { ApiSchema, makeElectricUrl } from '@livestore/sync-electric'
+
+const electricHost = 'http://localhost:30000' // Your Electric server
+
+/** Placeholder for your database factory function */
+declare const makeDb: (storeId: string) => {
+  migrate: () => Promise<void>
+  disconnect: () => Promise<void>
+  createEvents: (batch: (typeof ApiSchema.PushPayload.Type)['batch']) => Promise<void>
+}
+
+// GET /api/electric - Pull events (proxied through Electric)
+export const GET = async (request: Request) => {
+  const searchParams = new URL(request.url).searchParams
+  const { url, storeId, needsInit } = makeElectricUrl({
+    electricHost,
+    searchParams,
+    apiSecret: 'your-electric-secret',
+  })
+
+  // Add your authentication logic here
+  // if (!isAuthenticated(request)) {
+  //   return new Response('Unauthorized', { status: 401 })
+  // }
+
+  // Initialize database tables if needed
+  if (needsInit === true) {
+    const db = makeDb(storeId)
+    await db.migrate()
+    await db.disconnect()
+  }
+
+  // Proxy pull request to Electric server for reading
+  return fetch(url)
+}
+
+// POST /api/electric - Push events (direct database write)
+export const POST = async (request: Request) => {
+  const payload = await request.json()
+  const parsed = Schema.decodeUnknownSync(ApiSchema.PushPayload)(payload)
+
+  // Write events directly to Postgres table (bypasses Electric)
+  const db = makeDb(parsed.storeId)
+  await db.createEvents(parsed.batch)
+  await db.disconnect()
+
+  return Response.json({ success: true })
+}
+```
+
+<Warning>
+  Push events are written directly to Postgres, not through the Electric server. Avoid mutating event rows after they are written — the event log is append-only. If you receive a `delete` or `update` operation from Electric, it means the event log was modified directly, which will break sync.
+</Warning>
+
+## How event storage works
+
+Events are stored in a Postgres table with the naming pattern:
+
+```
+eventlog_{PERSISTENCE_FORMAT_VERSION}_{storeId}
+```
+
+`PERSISTENCE_FORMAT_VERSION` is managed internally and incremented when the storage schema changes.
+
+Each event row contains:
+- `seqNum` — global event sequence number
+- `parentSeqNum` — previous event's sequence number
+- `name` — event type identifier
+- `args` — event payload (JSON-encoded string)
+- `clientId` — originating client
+- `sessionId` — session that created the event
+
+## `onBackendIdMismatch` option
+
+When the Postgres database is reset or the event table is dropped, clients with cached data detect the mismatch:
+
+```typescript
+const store = await makeStore({
+  sync: {
+    backend: syncBackend,
+    onBackendIdMismatch: 'reset', // 'reset' | 'shutdown' | 'ignore'
+  },
+})
+```
+
+## When to choose ElectricSQL vs Cloudflare
+
+| | ElectricSQL | Cloudflare Workers |
+|---|---|---|
+| **Infrastructure** | Postgres + Electric server | Cloudflare (no self-hosting) |
+| **Real-time** | Long-polling | WebSocket (native) |
+| **Existing Postgres** | Yes (with schema match) | No |
+| **Inspectable storage** | Yes (standard SQL) | DO SQLite only by default |
+| **Self-hosted** | Yes | No |
+| **Edge deployment** | Optional | Native |
+
+Choose ElectricSQL if you already run Postgres and want to keep events in a standard SQL database you can query directly. Choose Cloudflare Workers if you want zero-infrastructure deployment, native WebSocket support, and edge performance.
+
+## FAQ
+
+### Can I use my existing Postgres database?
+
+Unless your database is already modelled as an event log following the `@livestore/sync-electric` storage format, you cannot use it directly with this sync backend. A migration path may be supported in the future — see [issue #286](https://github.com/livestorejs/livestore/issues/286).
+
+### Why do I need an API proxy in front of Electric?
+
+The proxy is where you implement:
+- Authentication and authorization
+- Rate limiting and quota management
+- Database initialization and migration
+- Custom business logic and validation
+
+The Electric server itself has no awareness of your application's auth model.
+
+## Example
+
+See the [todomvc-sync-electric](https://github.com/livestorejs/livestore/tree/main/examples/web-todomvc-sync-electric) example for a complete implementation.

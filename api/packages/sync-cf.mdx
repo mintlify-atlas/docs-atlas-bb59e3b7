@@ -1,0 +1,311 @@
+---
+title: '@livestore/sync-cf'
+description: 'Cloudflare Workers sync backend for LiveStore. Provides real-time multi-client synchronization via Durable Objects and WebSocket.'
+---
+
+`@livestore/sync-cf` is the official LiveStore sync backend built on [Cloudflare Workers](https://workers.cloudflare.com/) and [Durable Objects](https://developers.cloudflare.com/durable-objects/). It enables real-time synchronization across multiple clients using WebSocket connections.
+
+The package has three entry points:
+
+| Entry point | Purpose |
+|---|---|
+| `@livestore/sync-cf/cf-worker` | Cloudflare Worker and Durable Object code (server side) |
+| `@livestore/sync-cf/client` | Sync client transports (browser/Node.js/Expo) |
+| `@livestore/sync-cf/common` | Shared types used by both sides |
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/sync-cf
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/sync-cf
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/sync-cf
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Client — `@livestore/sync-cf/client`
+
+### makeWsSync
+
+Creates a WebSocket-based sync backend. Pass this to the adapter's `sync.backend` option.
+
+```typescript
+function makeWsSync(options: WsSyncOptions): SyncBackend.SyncBackendConstructor<SyncMetadata>
+```
+
+#### Parameters
+
+<ParamField path="options.url" type="string" required>
+  URL of the sync backend. Accepts `http`/`https` or `ws`/`wss` protocols.
+
+  ```typescript
+  url: 'wss://my-worker.example.workers.dev'
+  ```
+</ParamField>
+
+<ParamField path="options.ping.enabled" type="boolean" default="true">
+  Enable WebSocket ping/pong keepalive.
+</ParamField>
+
+<ParamField path="options.ping.requestTimeout" type="Duration" default="10 seconds">
+  How long to wait for a ping response before marking the connection as offline.
+</ParamField>
+
+<ParamField path="options.ping.requestInterval" type="Duration" default="10 seconds">
+  How often to send ping requests.
+</ParamField>
+
+<ParamField path="options.webSocketFactory" type="(url: string) => Effect<WebSocket, WebSocketError, Scope>">
+  Optional custom WebSocket factory for environments with non-standard WebSocket APIs.
+</ParamField>
+
+#### Example
+
+```typescript
+import { makeWsSync } from '@livestore/sync-cf/client'
+import { makePersistedAdapter } from '@livestore/adapter-web'
+
+const adapter = makePersistedAdapter({
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+  storage: { type: 'opfs' },
+  sync: {
+    backend: makeWsSync({ url: 'wss://my-worker.example.workers.dev' }),
+  },
+})
+```
+
+---
+
+## Server — `@livestore/sync-cf/cf-worker`
+
+### makeDurableObject
+
+Creates a Cloudflare Durable Object class that handles sync. One Durable Object instance is created per `storeId`.
+
+```typescript
+function makeDurableObject(options?: MakeDurableObjectClassOptions): {
+  new (ctx: DurableObjectState, env: Env): DurableObject & SyncBackendRpcInterface
+}
+```
+
+#### Options
+
+<ParamField path="options.onPush" type="(message: PushRequest, context: CallbackContext) => void | Promise<void>">
+  Called when a client pushes events. Use this for server-side validation of individual push operations.
+
+  ```typescript
+  onPush: async (message, { storeId, payload, headers }) => {
+    // validate message.batch
+  }
+  ```
+</ParamField>
+
+<ParamField path="options.onPull" type="(message: PullRequest, context: CallbackContext) => void | Promise<void>">
+  Called when a client requests to pull events.
+</ParamField>
+
+<ParamField path="options.forwardHeaders" type="string[] | ((request) => Record<string, string>)">
+  Forward request headers into `onPush`/`onPull` callbacks. Useful for cookie-based or header-based authentication inside the Durable Object.
+
+  ```typescript
+  // Forward specific headers by name
+  forwardHeaders: ['cookie', 'authorization']
+
+  // Or extract custom values
+  forwardHeaders: (request) => ({
+    'x-user-id': request.headers.get('x-user-id') ?? '',
+  })
+  ```
+</ParamField>
+
+<ParamField path="options.storage" type="{ _tag: 'do-sqlite' } | { _tag: 'd1'; binding: string }">
+  Storage engine for event persistence. Defaults to `{ _tag: 'do-sqlite' }` (Durable Object SQLite).
+
+  Use `d1` when you want a centralized, externally queryable database at the cost of an extra network hop.
+</ParamField>
+
+<ParamField path="options.enabledTransports" type="Set<'http' | 'ws' | 'do-rpc'>">
+  Which transport protocols to accept. Defaults to all three.
+</ParamField>
+
+<ParamField path="options.otel" type="{ baseUrl?: string; serviceName?: string }">
+  OpenTelemetry configuration for the Durable Object.
+</ParamField>
+
+#### Example Durable Object
+
+```typescript worker.ts
+import { makeDurableObject } from '@livestore/sync-cf/cf-worker'
+
+export class SyncBackendDO extends makeDurableObject({
+  onPush: async (message, { storeId }) => {
+    console.log(`Push to ${storeId}:`, message.batch.length, 'events')
+  },
+}) {}
+```
+
+### makeWorker
+
+Creates a Cloudflare Worker `fetch` handler that routes sync requests to the Durable Object. For simpler setups you can use this instead of writing a custom `fetch`.
+
+```typescript
+function makeWorker<TEnv, TDurableObjectRpc, TSyncPayload>(
+  options: MakeWorkerOptions<TEnv, TSyncPayload>,
+): CFWorker<TEnv, TDurableObjectRpc>
+```
+
+#### Options
+
+<ParamField path="options.syncBackendBinding" type="string" required>
+  The Durable Object binding name declared in `wrangler.toml`.
+</ParamField>
+
+<ParamField path="options.validatePayload" type="(payload, context) => void | Promise<void>">
+  Validates the client-provided payload during WebSocket connection. Throw to reject the connection.
+
+  The `context` includes `storeId` and `headers` (the raw request headers, regardless of `forwardHeaders` on the DO).
+
+  ```typescript
+  validatePayload: async (payload, { storeId, headers }) => {
+    const cookie = headers.get('cookie')
+    const session = await validateSessionFromCookie(cookie)
+    if (!session) throw new Error('Unauthorized')
+  }
+  ```
+</ParamField>
+
+<ParamField path="options.syncPayloadSchema" type="Schema.Schema<TSyncPayload>">
+  Optional Effect Schema to decode the client payload before passing it to `validatePayload`.
+</ParamField>
+
+<ParamField path="options.enableCORS" type="boolean" default="false">
+  Add CORS headers to responses.
+</ParamField>
+
+#### Example Worker
+
+```typescript worker.ts
+import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+
+export class SyncBackendDO extends makeDurableObject() {}
+
+export default makeWorker({
+  syncBackendBinding: 'SYNC_BACKEND_DO',
+  enableCORS: true,
+})
+```
+
+### handleSyncRequest
+
+Lower-level alternative to `makeWorker`. Handles a single LiveStore sync request. Use this when you have a custom `fetch` handler and want to forward only matching requests to LiveStore.
+
+```typescript
+function handleSyncRequest(options: { ... }): Promise<Response>
+```
+
+---
+
+## Wrangler configuration
+
+```toml wrangler.toml
+name = "my-sync-worker"
+main = "src/worker.ts"
+compatibility_date = "2024-11-01"
+
+[[durable_objects.bindings]]
+name = "SYNC_BACKEND_DO"
+class_name = "SyncBackendDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncBackendDO"]
+```
+
+<Note>
+  Use `new_sqlite_classes` (not `new_classes`) so the Durable Object gets the Durable Object SQLite storage backend.
+</Note>
+
+---
+
+## Full setup example
+
+<Steps>
+  <Step title="Define your schema">
+    ```typescript schema.ts
+    import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+    export const events = {
+      todoCreated: Events.synced({
+        name: 'v1.TodoCreated',
+        schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+      }),
+    }
+
+    export const schema = makeSchema({
+      events,
+      state: State.SQLite.makeState({ tables: { /* ... */ } }),
+    })
+    ```
+  </Step>
+  <Step title="Create the Cloudflare Worker">
+    ```typescript src/worker.ts
+    import { makeDurableObject, makeWorker } from '@livestore/sync-cf/cf-worker'
+
+    export class SyncBackendDO extends makeDurableObject() {}
+
+    export default makeWorker({
+      syncBackendBinding: 'SYNC_BACKEND_DO',
+    })
+    ```
+  </Step>
+  <Step title="Configure wrangler.toml">
+    ```toml wrangler.toml
+    name = "my-sync-worker"
+    main = "src/worker.ts"
+    compatibility_date = "2024-11-01"
+
+    [[durable_objects.bindings]]
+    name = "SYNC_BACKEND_DO"
+    class_name = "SyncBackendDO"
+
+    [[migrations]]
+    tag = "v1"
+    new_sqlite_classes = ["SyncBackendDO"]
+    ```
+  </Step>
+  <Step title="Connect from the client">
+    ```typescript app.ts
+    import { makeWsSync } from '@livestore/sync-cf/client'
+    import { makePersistedAdapter } from '@livestore/adapter-web'
+
+    const adapter = makePersistedAdapter({
+      worker: LiveStoreWorker,
+      sharedWorker: LiveStoreSharedWorker,
+      storage: { type: 'opfs' },
+      sync: {
+        backend: makeWsSync({ url: 'wss://my-sync-worker.example.workers.dev' }),
+      },
+    })
+    ```
+  </Step>
+</Steps>
+
+## Peer dependencies
+
+| Package | Version |
+|---|---|
+| `effect` | `^3.19.19` |
+| `@cloudflare/workers-types` | `4.x` |

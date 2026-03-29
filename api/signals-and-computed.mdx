@@ -1,0 +1,268 @@
+---
+title: Signals and computed
+description: Create reactive in-memory state with signal() and derived reactive values with computed().
+---
+
+LiveStore's reactivity system provides three types of reactive state:
+
+- `queryDb()` — reactive SQL queries backed by SQLite
+- `signal()` — reactive in-memory values (not persisted)
+- `computed()` — derived values that recalculate when their dependencies change
+
+Reactive state variables end with a `$` by convention (e.g. `todos$`, `count$`).
+
+---
+
+## `signal`
+
+Creates a reactive in-memory value. Signals are useful for ephemeral UI state — such as search text, selected item IDs, or filter settings — that needs to trigger query re-evaluation but should not be stored in the database or synced to other clients.
+
+```typescript
+const signal: <T>(
+  defaultValue: T,
+  options?: {
+    label?: string
+  },
+) => SignalDef<T>
+```
+
+### Parameters
+
+<ParamField body="defaultValue" type="T" required>
+  The initial value of the signal. Can be any type: primitives, objects, arrays, or functions.
+</ParamField>
+
+<ParamField body="options.label" type="string">
+  Human-readable name shown in the DevTools for this signal. Recommended for all signals to ease debugging.
+</ParamField>
+
+### Return type
+
+`signal()` returns a `SignalDef<T>` — a reusable definition, not an active instance. The signal is instantiated the first time it is used with a store.
+
+### Reading a signal
+
+Use `store.query(signal$)` for a synchronous one-shot read, or pass the signal to `store.subscribe()` / `store.useQuery()` for reactive subscriptions.
+
+```typescript
+import { signal, type Store } from '@livestore/livestore'
+
+const count$ = signal(0, { label: 'count$' })
+
+// Read the current value
+const value = store.query(count$) // 0
+```
+
+### Setting a signal
+
+Use `store.setSignal(signal$, newValue)` to update the signal's value. Accepts either a new value or an updater function that receives the previous value.
+
+```typescript
+store.setSignal: <T>(signalDef: SignalDef<T>, value: T | ((prev: T) => T)) => void
+```
+
+```typescript
+const count$ = signal(0, { label: 'count$' })
+
+// Set directly
+store.setSignal(count$, 42)
+
+// Update with a function
+store.setSignal(count$, (prev) => prev + 1)
+store.setSignal(count$, (prev) => prev + 1)
+
+console.log(store.query(count$)) // 2
+```
+
+### Complete signal example
+
+```typescript
+import { signal, type Store } from '@livestore/livestore'
+import type { schema } from './schema.ts'
+
+declare const store: Store<typeof schema>
+
+// Timer signal
+const now$ = signal(Date.now(), { label: 'now$' })
+
+setInterval(() => {
+  store.setSignal(now$, Date.now())
+}, 1000)
+
+// Object signal for multi-field UI state
+const uiState$ = signal(
+  { filter: 'all' as 'all' | 'active' | 'completed', search: '' },
+  { label: 'uiState$' },
+)
+
+const setFilter = (filter: 'all' | 'active' | 'completed') =>
+  store.setSignal(uiState$, (prev) => ({ ...prev, filter }))
+
+const setSearch = (search: string) =>
+  store.setSignal(uiState$, (prev) => ({ ...prev, search }))
+```
+
+---
+
+## `computed`
+
+Creates a derived reactive value from other queries, signals, or computed values. The computation re-runs only when its dependencies change. If the new result is equal to the previous one, downstream subscribers are not notified.
+
+```typescript
+const computed: <TResult>(
+  fn: (get: GetAtomResult) => TResult,
+  options?: {
+    label?: string
+    deps?: DepKey
+  },
+) => LiveQueryDef<TResult>
+```
+
+### Parameters
+
+<ParamField body="fn" type="(get: GetAtomResult) => TResult" required>
+  Pure function that computes the result. Call `get(query$)` inside the function to read other reactive values and register them as dependencies. When any dependency changes, `fn` re-evaluates.
+</ParamField>
+
+<ParamField body="options.label" type="string">
+  Human-readable name shown in the DevTools.
+</ParamField>
+
+<ParamField body="options.deps" type="DepKey">
+  Explicit dependency key. **Required on Expo / React Native** where `fn.toString()` returns `[native code]`.
+
+  ```typescript
+  type DepKey = string | ReadonlyArray<string | number | boolean | undefined | null>
+  ```
+</ParamField>
+
+### Return type
+
+`computed()` returns a `LiveQueryDef<TResult>`. Use it with `store.query()`, `store.subscribe()`, or `store.useQuery()` just like a `queryDb` definition.
+
+### Examples
+
+```typescript
+import { computed, queryDb, signal } from '@livestore/livestore'
+import { tables } from './schema.ts'
+
+// Derive a count from a database query
+const todos$ = queryDb(tables.todos.select(), { label: 'todos$' })
+const todoCount$ = computed((get) => get(todos$).length, { label: 'todoCount$' })
+
+// Multiply a signal
+const num$ = signal(0, { label: 'num$' })
+const doubled$ = computed((get) => get(num$) * 2, { label: 'doubled$' })
+```
+
+```typescript
+// Combine multiple queries into derived stats
+const stats$ = computed((get) => {
+  const todos = get(todos$)
+  const completed = todos.filter((t) => t.completed).length
+  return {
+    total: todos.length,
+    completed,
+    remaining: todos.length - completed,
+    percentComplete: todos.length > 0 ? (completed / todos.length) * 100 : 0,
+  }
+}, { label: 'todoStats$' })
+```
+
+```typescript
+// Chain computed values
+const hasCompleted$ = computed(
+  (get) => get(stats$).completed > 0,
+  { label: 'hasCompleted$' },
+)
+```
+
+---
+
+## Using reactive state with the store
+
+All three reactive types (`queryDb`, `signal`, `computed`) are accessed the same way:
+
+```typescript
+import { queryDb, signal, computed, type Store } from '@livestore/livestore'
+
+declare const store: Store<typeof schema>
+
+const count$ = queryDb(tables.todos.count(), { label: 'count$' })
+
+// One-shot read
+const value = store.query(count$)
+
+// Reactive subscription
+const unsubscribe = store.subscribe(count$, (value) => {
+  console.log('count changed:', value)
+})
+
+unsubscribe()
+```
+
+---
+
+## Reactive queries that depend on signals
+
+Combine `signal` and `queryDb` to build queries that react to both database changes and local UI state.
+
+```typescript
+import { queryDb, signal } from '@livestore/livestore'
+import { tables } from './schema.ts'
+
+// Signal holding search text
+const search$ = signal('', { label: 'search$' })
+
+// Query that re-runs when either the todos table OR search$ changes
+const filtered$ = queryDb(
+  (get) => {
+    const text = get(search$)
+    return text.length > 0
+      ? tables.todos.where({ text: { $like: `%${text}%` } })
+      : tables.todos.select()
+  },
+  { label: 'filtered$' },
+)
+
+// Update the signal
+store.setSignal(search$, 'milk')
+
+// Query re-executes automatically
+const results = store.query(filtered$)
+```
+
+---
+
+## Naming convention
+
+By convention, reactive state variable names end with a `$` suffix. This makes it easy to distinguish definitions from plain values:
+
+```typescript
+// Reactive definitions — named with $
+const todos$ = queryDb(tables.todos.select())
+const search$ = signal('')
+const count$ = computed((get) => get(todos$).length)
+
+// Plain values — no $
+const todos = store.query(todos$)
+const count = store.query(count$)
+```
+
+---
+
+## When to use signals vs `queryDb`
+
+| | `queryDb` | `signal` |
+| --- | --- | --- |
+| **Persisted** | Yes (via events) | No |
+| **Synced** | Yes | No |
+| **Source of truth** | SQLite tables | In-memory only |
+| **Lifetime** | Store lifetime | Store lifetime |
+| **Typical use** | Application data | UI state, filters, selections |
+
+Use `queryDb` for any data that should survive a page reload or be visible to other clients. Use `signal` for transient UI state — selected items, open panels, search text — that should reset when the store restarts.
+
+<Note>
+  Signals are lost on page reload. If you need persistent local-only state, define a `State.SQLite.clientDocument` table and commit `Events.clientOnly` events instead.
+</Note>

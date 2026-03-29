@@ -1,0 +1,227 @@
+---
+title: Introduction
+description: LiveStore is an event-driven data layer with a built-in sync engine. Commit immutable events, materialize state into reactive SQLite, and sync across all clients automatically.
+---
+
+## What is LiveStore?
+
+LiveStore is an event-driven data layer with a built-in sync engine. Its primary use case is building complex, client-side apps — like Linear, Figma, or Notion — that also work offline.
+
+Think of LiveStore as a next-generation state management library (like Zustand or Redux) that also **persists** and **distributes** state across clients and devices.
+
+<CardGroup cols={3}>
+  <Card title="UX" icon="user">
+    **Synced** — real-time updates across devices. **Fast** — no async loading over the network. **Persistent** — works offline and survives page refresh.
+  </Card>
+  <Card title="DX" icon="code">
+    **Principled** — event-driven instead of mutable state. **Type-safe** — fully typed events and queries. **Reactive** — automatic UI updates when data changes.
+  </Card>
+  <Card title="AX" icon="robot">
+    **Testable** — immutable eventlog for tight feedback loops. **Debuggable** — same events always produce the same state. **Evolvable** — reset and fork state for experiments.
+  </Card>
+</CardGroup>
+
+LiveStore works cross-platform and can be used for UI apps (web, mobile, desktop), AI agents, CLIs, scripts, and server-to-server applications.
+
+## The core idea: synced events → state → UI
+
+Unlike other sync solutions, LiveStore syncs **events** — not state.
+
+Events are immutable facts that describe what happened (`TodoCreated`, `TodoCompleted`). State is derived by replaying those events. Every client reconstructs the same state from the same event history, making sync predictable and debuggable. State changes then trigger reactive UI updates.
+
+### Traditional state management uses ephemeral, in-memory state
+
+With traditional state management you dispatch actions that update an in-memory store, and the UI reacts to changes. But that state vanishes when the user refreshes or closes the browser. Add persistence and you need to manage local storage as a secondary database. Add sync and you're dealing with conflict resolution, offline queues, and backend integration.
+
+LiveStore handles all of this through one unified pattern: **event sourcing**.
+
+Instead of mutating state directly, you commit **events** that describe what happened. These events are persisted to an **eventlog** (like a git history) and automatically materialized into a local **SQLite database** that your UI queries reactively.
+
+<Note>
+While most apps use SQLite as the data store for persistence, LiveStore is flexible enough to materialize state into other targets as well (for example, file systems).
+</Note>
+
+### Comparison with traditional state management
+
+If you've used Redux, committing events will feel familiar: events are like actions, materializers are like reducers, and the SQLite state is like your store. But there are key differences:
+
+| | Redux | LiveStore |
+|---|---|---|
+| Write model | Actions dispatch → reducers update in-memory state | Events commit → materializers update SQLite |
+| Persistence | State lost on refresh | Events persisted locally |
+| Sync | Requires external setup | Built-in via eventlog |
+| Query model | Fixed state shape | Query any shape with SQL |
+| Bundle size | Small | Larger (includes SQLite) |
+
+## A practical example
+
+Every LiveStore app starts with a **schema** made of three parts:
+
+- **Events** — describe what can happen in your app
+- **State** — defines how data is stored (SQLite tables)
+- **Materializers** — map events to state changes
+
+### Define your schema
+
+```typescript schema.ts
+import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+// 1. Define events (the things that can happen in your app)
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({
+      id: Schema.String,
+      text: Schema.String,
+    }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+}
+
+// 2. Define SQLite tables (how to query your state)
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+    },
+  }),
+}
+
+// 3. Define materializers (how to turn events into state)
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+export const schema = makeSchema({ events, state })
+```
+
+### Use it in React
+
+LiveStore includes integrations for all major frontend frameworks. The `queryDb` function creates a reactive query that updates automatically when its data changes:
+
+```tsx TodoApp.tsx
+import { useCallback } from 'react'
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { queryDb } from '@livestore/livestore'
+import { useStore } from '@livestore/react'
+import { events, schema, tables } from './schema.ts'
+
+const adapter = makeInMemoryAdapter()
+
+const useAppStore = () =>
+  useStore({ storeId: 'my-app', schema, adapter, batchUpdates })
+
+// Define a reactive query — updates automatically when todos change
+const visibleTodos$ = queryDb(() => tables.todos, { label: 'visibleTodos' })
+
+export const TodoApp = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(visibleTodos$)
+
+  const addTodo = useCallback(
+    (text: string) => {
+      store.commit(events.todoCreated({ id: crypto.randomUUID(), text }))
+    },
+    [store],
+  )
+
+  const completeTodo = useCallback(
+    (id: string) => {
+      store.commit(events.todoCompleted({ id }))
+    },
+    [store],
+  )
+
+  return (
+    <div>
+      <button type="button" onClick={() => addTodo('New todo')}>Add</button>
+      {todos.map((todo) => (
+        <button key={todo.id} type="button" onClick={() => completeTodo(todo.id)}>
+          {todo.completed ? '✓' : '○'} {todo.text}
+        </button>
+      ))}
+    </div>
+  )
+}
+```
+
+Notice there is no loading state — SQLite runs in-memory on the main thread, so reads are synchronous and instant.
+
+### Add sync via Cloudflare
+
+When you're ready to sync state across clients, configure a sync backend in your worker:
+
+```typescript worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { makeWsSync } from '@livestore/sync-cf/client'
+import { schema } from './schema.ts'
+
+makeWorker({
+  schema,
+  sync: {
+    backend: makeWsSync({ url: `${location.origin}/sync` }),
+  },
+})
+```
+
+That's all the configuration needed. Your app works offline automatically. When connectivity returns, LiveStore syncs pending events and reconciles state.
+
+## Why events?
+
+Committing events rather than mutating state directly gives you several advantages:
+
+<AccordionGroup>
+  <Accordion title="Events capture intent, not just outcome">
+    When you mutate state directly (`todo.completed = true`), you lose the _why_. Events like `TodoCompleted` preserve the user's intent, which matters for debugging, analytics, undo/redo, and activity feeds.
+  </Accordion>
+  <Accordion title="Events decouple what happened from how it's stored">
+    Your state shape can evolve independently of your event history. Need a new denormalized table for performance? Add a materializer — no data migration required.
+  </Accordion>
+  <Accordion title="Events make sync tractable">
+    Syncing mutable state across devices is hard (which field wins?). Syncing an append-only event log is simpler: you're merging histories, not reconciling conflicting states.
+  </Accordion>
+  <Accordion title="Events give you a full audit trail">
+    Every change is recorded. You can replay events to reconstruct any point in time, debug state transitions, or implement time-travel debugging via the devtools.
+  </Accordion>
+</AccordionGroup>
+
+## When LiveStore fits
+
+<CardGroup cols={2}>
+  <Card title="Good fit" icon="circle-check">
+    Productivity apps, collaborative tools, offline-first apps, apps with complex local state needing SQL queries, cross-platform apps (web, mobile, desktop, server).
+  </Card>
+  <Card title="Not a good fit" icon="circle-xmark">
+    Data that must live on an existing server database, traditional client-server apps without offline needs, unbounded data that won't fit in client memory.
+  </Card>
+</CardGroup>
+
+<Tip>
+If you're unsure, try the [evaluation exercise](/when-to-use#evaluation-exercise) — model your app's events in a few minutes to see if the pattern feels natural.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="How LiveStore works" icon="gears" href="/how-livestore-works">
+    Deep dive into the architecture: event flow, leader thread, sync, and conflict resolution
+  </Card>
+  <Card title="Concepts" icon="layer-group" href="/concepts">
+    Reference for every LiveStore concept: adapters, sessions, schemas, reactivity, and more
+  </Card>
+  <Card title="When to use LiveStore" icon="scale-balanced" href="/when-to-use">
+    Detailed evaluation guide and comparison with alternatives
+  </Card>
+  <Card title="Quick start (React)" icon="rocket" href="/getting-started/quickstart-react">
+    Set up a React app with LiveStore in minutes
+  </Card>
+</CardGroup>

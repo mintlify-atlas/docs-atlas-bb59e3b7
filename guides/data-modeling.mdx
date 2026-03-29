@@ -1,0 +1,391 @@
+---
+title: Data modeling
+description: Design events, state tables, and containers for LiveStore applications using event sourcing best practices.
+---
+
+Data modeling is one of the most consequential decisions you make in a LiveStore application. Unlike traditional CRUD apps, LiveStore separates the write model (events) from the read model (SQLite state tables). Getting this separation right gives you a durable audit log, offline support, and the ability to evolve your app over time.
+
+## The core idea: separate read and write models
+
+In LiveStore, you never mutate state directly. Instead, you commit immutable **events** that describe what happened. **Materializers** then translate those events into rows in your local SQLite database, which forms the read model.
+
+```
+Event committed → Materializer runs → SQLite row written → React re-renders
+```
+
+This separation means:
+
+- The event log is the source of truth — you can always rebuild the read model by replaying events
+- Multiple read model shapes can be derived from the same events
+- The event log is portable: sync it to another device and replay to produce identical state
+
+<Tip>
+Think of events as the write model and SQLite tables as the read model. Only the events are synced between clients — state tables are rebuilt locally from the event log.
+</Tip>
+
+## Designing events
+
+Events describe **what happened**, not what to do. This distinction matters: an imperative command (`setUserName`) is harder to reason about across time than a fact (`userNameChanged`).
+
+### Event naming conventions
+
+Use past-tense, domain-language names for events:
+
+```typescript
+// Good: describes what happened
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+}
+
+// Avoid: imperative commands
+// setTodoText, updateTodo, deleteTodo
+```
+
+### What to put in event payloads
+
+Include the minimum data needed for the materializer to update state correctly. Avoid derived or computed values in event payloads — compute them in the materializer or at query time instead.
+
+```typescript
+// Good: minimal payload
+todoCreated: Events.synced({
+  name: 'v1.TodoCreated',
+  schema: Schema.Struct({
+    id: Schema.String,
+    text: Schema.String,
+  }),
+})
+
+// Avoid: computed data in payload
+todoCreated: Events.synced({
+  name: 'v1.TodoCreated',
+  schema: Schema.Struct({
+    id: Schema.String,
+    text: Schema.String,
+    createdAtFormatted: Schema.String, // computed — put this in the UI layer
+    wordCount: Schema.Number,          // derived — materializer or query
+  }),
+})
+```
+
+### Version your event names from the start
+
+Always include a version prefix in event names (`v1.`, `v2.`, ...). This makes schema evolution explicit and avoids ambiguity when you need to change an event shape later.
+
+```typescript
+Events.synced({ name: 'v1.TodoCreated', schema: Schema.Struct({ id: Schema.String, text: Schema.String }) })
+```
+
+## Designing state tables
+
+State tables are the SQLite read model. They are derived from events and can be changed freely as long as the materializers are updated to match.
+
+### Basic table definition
+
+```typescript
+import { State } from '@livestore/livestore'
+
+export const userTable = State.SQLite.table({
+  name: 'users',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    email: State.SQLite.text(),
+    name: State.SQLite.text(),
+    age: State.SQLite.integer({ default: 0 }),
+    isActive: State.SQLite.boolean({ default: true }),
+    metadata: State.SQLite.json({ nullable: true }),
+  },
+  indexes: [{ name: 'idx_users_email', columns: ['email'], isUnique: true }],
+})
+```
+
+### Writing materializers
+
+Materializers translate events into table operations. They must be **deterministic** — the same event must always produce the same mutations.
+
+```typescript
+import { defineMaterializer, Events, Schema, State } from '@livestore/livestore'
+
+export const todos = State.SQLite.table({
+  name: 'todos',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    text: State.SQLite.text(),
+    completed: State.SQLite.boolean({ default: false }),
+  },
+})
+
+export const events = {
+  todoCreated: Events.synced({
+    name: 'todoCreated',
+    schema: Schema.Struct({
+      id: Schema.String,
+      text: Schema.String,
+      completed: Schema.Boolean.pipe(Schema.optional),
+    }),
+  }),
+  factoryResetApplied: Events.synced({
+    name: 'factoryResetApplied',
+    schema: Schema.Struct({}),
+  }),
+} as const
+
+export const materializers = State.SQLite.materializers(events, {
+  [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ id, text, completed }) =>
+    todos.insert({ id, text, completed: completed ?? false }),
+  ),
+  [events.factoryResetApplied.name]: defineMaterializer(events.factoryResetApplied, () => [
+    { sql: 'DELETE FROM todos', bindValues: {} },
+  ]),
+})
+```
+
+<Warning>
+Never include side effects (network calls, logging) inside materializers. Materializers run every time the event log is replayed, so side effects would fire repeatedly and produce inconsistent results.
+</Warning>
+
+## Soft deletes vs hard deletes
+
+Avoid `DELETE` events. When you delete a row by committing a delete event, information is permanently lost from the state model. If you need to add a "restore" feature later, there is nothing to restore.
+
+Instead, use **soft deletes**: add a `deletedAt` or `isDeleted` column to your table and set it in a materializer.
+
+```typescript
+export const todos = State.SQLite.table({
+  name: 'todos',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    text: State.SQLite.text(),
+    completed: State.SQLite.boolean({ default: false }),
+    deletedAt: State.SQLite.integer({ nullable: true }), // Unix timestamp or null
+  },
+})
+
+export const events = {
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Number }),
+  }),
+} as const
+
+// Materializer sets deletedAt instead of removing the row
+[events.todoDeleted.name]: defineMaterializer(events.todoDeleted, ({ id, deletedAt }) =>
+  todos.update({ deletedAt }, { where: { id } }),
+)
+```
+
+Then filter deleted items in your queries:
+
+```typescript
+const activeTodos$ = queryDb(
+  todos.select().where(sql`deleted_at IS NULL`),
+  { label: 'activeTodos' },
+)
+```
+
+Soft deletes give you:
+- A recoverable history — undo deletes by clearing `deletedAt`
+- A complete audit trail
+- Compatibility with sync: a delete event from one client doesn't conflict with an in-progress edit from another
+
+## List ordering patterns
+
+When users can reorder items (drag-and-drop, manual sorting), use **fractional indexing** to store order positions. Traditional integer ordering (1, 2, 3) requires renumbering multiple items on reorder, which creates conflicts in distributed systems.
+
+Fractional indexing uses string-based positions that always allow insertion between any two existing positions.
+
+<Steps>
+  <Step title="Install the library">
+    ```bash
+    pnpm install fractional-indexing
+    ```
+  </Step>
+  <Step title="Define the schema">
+    Add a `text` column for the order value and index it for efficient queries.
+
+    ```typescript
+    import { State } from '@livestore/livestore'
+
+    export const task = State.SQLite.table({
+      name: 'task',
+      columns: {
+        id: State.SQLite.integer({ primaryKey: true }),
+        title: State.SQLite.text({ default: '' }),
+        completed: State.SQLite.integer({ default: 0 }),
+        /** Fractional index for ordering tasks in the list */
+        order: State.SQLite.text({ nullable: false, default: '' }),
+      },
+      indexes: [
+        { name: 'task_order', columns: ['order'] },
+      ],
+    })
+    ```
+  </Step>
+  <Step title="Create ordered items">
+    ```typescript
+    import { generateKeyBetween } from 'fractional-indexing'
+
+    export const createTaskAtEnd = (title: string) => {
+      const highestOrder = store.query(tables.task.select('order').orderBy('order', 'desc').limit(1))[0] ?? null
+      const order = generateKeyBetween(highestOrder, null)
+      store.commit(events.createTask({ title, order }))
+    }
+    ```
+  </Step>
+  <Step title="Handle reordering">
+    ```typescript
+    import { generateKeyBetween } from 'fractional-indexing'
+
+    export const reorderTask = (taskId: number, beforeOrder: string | null, afterOrder: string | null) => {
+      const newOrder = generateKeyBetween(beforeOrder, afterOrder)
+      store.commit(events.updateTaskOrder({ id: taskId, order: newOrder }))
+    }
+    ```
+  </Step>
+  <Step title="Query in order">
+    ```typescript
+    export const getOrderedTasks = () =>
+      store.query(tables.task.select().orderBy('order', 'asc'))
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Always use standard string comparison for fractional index ordering. Avoid `String.prototype.localeCompare()`, which may produce incorrect sort order.
+</Note>
+
+## When to split into multiple containers
+
+A **container** is an isolated store instance with its own event log and state tables. There is no transactional consistency between containers.
+
+Split into multiple containers when you need:
+
+<AccordionGroup>
+  <Accordion title="Data isolation and access control">
+    If different users or roles should only see a subset of data, put that data in separate containers. Sync access can then be enforced per container at the backend.
+  </Accordion>
+  <Accordion title="Scalability">
+    A single container's event log grows over time. If you have high-frequency events that don't need to coexist with lower-frequency events (e.g., real-time cursor positions vs. document edits), split them so each can be pruned or scaled independently.
+  </Accordion>
+  <Accordion title="Multi-tenant applications">
+    In a SaaS app, each workspace or tenant typically maps to a separate container. This ensures one tenant's data is never visible to another.
+  </Accordion>
+  <Accordion title="Separating local-only from synced state">
+    UI state (collapsed panels, selected rows, scroll positions) that should never leave the device can live in a local-only container while the shared domain data lives in a synced container.
+  </Accordion>
+</AccordionGroup>
+
+## Schema evolution
+
+### Evolving state tables
+
+State table changes (adding columns, renaming, changing defaults) are generally safe as long as you update the materializers to match. Because the read model is derived from the event log, you can wipe and rebuild the state tables at any time.
+
+### Evolving event schemas
+
+Event schema changes require more care because old events already committed to the log must remain readable.
+
+**Safe changes:**
+- Adding an optional field with a default value
+- Adding a new event type
+
+**Unsafe changes:**
+- Removing a required field
+- Changing a field's type
+- Renaming an event
+
+For breaking changes, create a new version of the event instead of modifying the existing one:
+
+```typescript
+const events = {
+  // Keep v1 for backward compatibility
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  // New v2 adds assignee
+  todoCreatedV2: Events.synced({
+    name: 'v2.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String, assigneeId: Schema.String }),
+  }),
+}
+```
+
+Then write materializers for both versions so old and new events both produce correct state.
+
+### Handling unknown events during app evolution
+
+When you deploy a new app version with new event types, older clients may see events they don't recognize. Configure `unknownEventHandling` in your schema to control this behavior:
+
+```typescript
+import { defineMaterializer, Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+const _schema = makeSchema({
+  events,
+  state,
+  unknownEventHandling: {
+    strategy: 'callback',
+    onUnknownEvent: (event, error) => {
+      console.warn('LiveStore saw an unknown event', { event, reason: error.reason })
+    },
+  },
+})
+```
+
+| Strategy | Behavior |
+|----------|----------|
+| `'warn'` | Log and continue (default) |
+| `'ignore'` | Silently skip unknown events |
+| `'fail'` | Throw an error — useful during development |
+| `'callback'` | Forward to your telemetry and continue |
+
+## App evolution patterns
+
+As your app grows, you may need to change how data is structured beyond a simple schema update. Common scenarios:
+
+### Adding a new concept
+
+**Example:** Your app has workspaces. You want to add projects inside each workspace, and pre-populate a default project for each existing workspace.
+
+Approach: Add a new event (`defaultProjectCreated`) and emit it for each existing workspace as a **migration event** during app startup. The materializer creates the default project rows. Because events are idempotent by ID, replaying the log won't duplicate the projects.
+
+### Renaming or splitting a concept
+
+When a concept changes significantly, create new events describing the new model and write a one-time migration that reads the old state and commits events describing the new structure. The old events remain in the log but the new events overlay the state.
+
+### Data backfill
+
+Add a migration that runs once (keyed by a migration ID in a local table) and commits events to populate new fields or tables. Check the migration ID on startup before committing.
+
+## Common modeling mistakes to avoid
+
+<AccordionGroup>
+  <Accordion title="Putting mutable IDs in events">
+    Never use mutable values (user-supplied names, timestamps without a stable ID) as primary identifiers in events. Use UUID or nanoid-generated IDs instead, and include them in the event payload.
+  </Accordion>
+  <Accordion title="Command-style event names">
+    Event names like `setColor` or `updateUser` suggest mutation rather than a fact. Use past-tense names that describe what happened: `colorChanged`, `userProfileUpdated`.
+  </Accordion>
+  <Accordion title="Putting UI state in synced events">
+    Scroll positions, panel open/closed state, and hover state don't belong in synced events. Use local-only events or a separate local container for transient UI state.
+  </Accordion>
+  <Accordion title="Skipping event versioning">
+    Without a version prefix in event names, you can't safely add a new version of an event. Add `v1.` prefixes from the start.
+  </Accordion>
+  <Accordion title="Side effects in materializers">
+    Materializers must be pure. Any side effect (API calls, logging, random values) will run on every replay of the event log. Move side effects to event handlers or to the application layer that commits events.
+  </Accordion>
+  <Accordion title="Overloaded events">
+    Avoid events that update many unrelated fields at once (e.g., `userUpdated` that changes name, avatar, and preferences simultaneously). Separate concerns into distinct events so each change has a clear meaning in the history.
+  </Accordion>
+</AccordionGroup>

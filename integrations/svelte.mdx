@@ -1,0 +1,141 @@
+---
+title: Svelte integration
+description: Integrate LiveStore with Svelte using the createStore helper and reactive store.query calls that automatically re-run inside Svelte effects and markup.
+---
+
+The `@livestore/svelte` package exposes a single helper, `createStore`, which binds `store.query` into Svelte's reactivity system. When you call `store.query` inside `$effect` or markup, query results re-run automatically when LiveStore emits updates. Requests are cancelled on teardown via Svelte's abort signal.
+
+## Installation
+
+```bash
+npm install @livestore/svelte @livestore/livestore @livestore/adapter-web @livestore/wa-sqlite
+```
+
+## Setup
+
+<Steps>
+  <Step title="Create a worker file">
+    Create a dedicated worker file for the LiveStore web worker:
+
+    ```typescript livestore.worker.ts
+    import { makeWorker } from '@livestore/adapter-web/worker'
+    import { schema } from './schema.ts'
+
+    makeWorker({ schema })
+    ```
+  </Step>
+  <Step title="Create and use the store">
+    Call `createStore` where you have access to the adapter — typically in a route `load` function, `onMount`, or a top-level module that runs in the browser.
+
+    ```svelte App.svelte
+    <script lang="ts">
+      import { makePersistedAdapter } from '@livestore/adapter-web'
+      import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+      import { queryDb } from '@livestore/livestore'
+      import { createStore } from '@livestore/svelte'
+
+      import LiveStoreWorker from './livestore.worker.ts?worker'
+      import { schema, tables } from './schema.ts'
+
+      const adapter = makePersistedAdapter({
+        storage: { type: 'opfs' },
+        worker: LiveStoreWorker,
+        sharedWorker: LiveStoreSharedWorker,
+      })
+
+      const store = await createStore<typeof schema>({
+        adapter,
+        schema,
+        storeId: 'default',
+      })
+
+      const todos$ = queryDb(tables.todos.where({ completed: false }), {
+        label: 'todos',
+      })
+    </script>
+
+    <ul>
+      {#each store.query(todos$) as todo (todo.id)}
+        <li>{todo.text}</li>
+      {/each}
+    </ul>
+    ```
+  </Step>
+</Steps>
+
+## Reactive queries
+
+`store.query` opts into Svelte's reactivity when called inside `$effect` or markup. The query result re-evaluates whenever the underlying data changes.
+
+```svelte TodoList.svelte
+<script lang="ts">
+  import { queryDb } from '@livestore/livestore'
+  import { tables } from './schema.ts'
+
+  // store is created in a parent scope (e.g. via prop or context)
+  const { store } = $props()
+
+  const activeTodos$ = queryDb(tables.todos.where({ completed: false }), {
+    label: 'activeTodos',
+  })
+</script>
+
+<ul>
+  {#each store.query(activeTodos$) as todo (todo.id)}
+    <li>{todo.text}</li>
+  {/each}
+</ul>
+```
+
+Outside reactive contexts, you can use `store.subscribe` directly for manual subscription management.
+
+## Committing events
+
+Call `store.commit()` to dispatch events. LiveStore propagates the event to all reactive queries automatically.
+
+```svelte TodoInput.svelte
+<script lang="ts">
+  import { events } from './schema.ts'
+
+  const { store } = $props()
+
+  let text = $state('')
+
+  function addTodo() {
+    if (!text.trim()) return
+    store.commit(events.todoCreated({ id: crypto.randomUUID(), text, createdAt: new Date() }))
+    text = ''
+  }
+</script>
+
+<input bind:value={text} placeholder="Add a todo" />
+<button onclick={addTodo}>Add</button>
+```
+
+## Usage notes
+
+- `createStore` is async. Await it in a context that supports async initialization — a route `load` function, `onMount`, or a top-level browser module.
+- Works with the web adapter out of the box.
+- For SSR routes, construct the store on the client. `@livestore/adapter-web` is browser-only and requires OPFS, which is not available in a server environment.
+
+## API reference
+
+### `createStore<Schema>(options)`
+
+Creates and returns a LiveStore instance integrated with Svelte's reactivity.
+
+| Option | Type | Description |
+|---|---|---|
+| `storeId` | `string` | Unique identifier for the store |
+| `schema` | `Schema` | The LiveStore schema |
+| `adapter` | `Adapter` | The platform adapter (e.g., `makePersistedAdapter()`) |
+
+Returns a promise that resolves to a store instance with a reactive `store.query` method.
+
+### `store.query(queryable)`
+
+Executes a reactive query. When called inside `$effect` or Svelte markup, re-evaluates automatically whenever the underlying data changes. Accepts any `Queryable` — a `QueryBuilder`, `LiveQueryDef`, or `SignalDef`.
+
+### `store.commit(...events)`
+
+Commits one or more events to the store. Triggers reactive updates for all active queries that depend on the affected data.

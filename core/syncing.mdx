@@ -1,0 +1,225 @@
+---
+title: 'Syncing'
+description: 'How LiveStore syncs events across clients using a push/pull model, causal ordering, and client-side rebasing.'
+---
+
+LiveStore is built on [event sourcing](/concepts): it syncs **events**, not database state. Every client maintains a local SQLite database materialized from the event log. The sync backend stores the canonical event log and determines the global total order of events.
+
+## How sync works
+
+<Steps>
+  <Step title="Events are committed locally">
+    When your app calls `store.commit(event)`, the event is immediately applied to local state as a pending event. The UI updates without waiting for the network.
+  </Step>
+  <Step title="Events are pushed to the sync backend">
+    The client leader thread pushes pending events to the sync backend. Before pushing, any upstream events that arrived since the last push must be pulled and applied first (similar to `git pull --rebase` before `git push`).
+  </Step>
+  <Step title="The backend assigns a global sequence number">
+    The sync backend validates the event, appends it to the canonical event log, and assigns a global sequence number. It notifies other clients of the new event.
+  </Step>
+  <Step title="Other clients pull and materialize">
+    Other clients receive the new event, append it to their local event log, and run the materializer to update their local SQLite state.
+  </Step>
+</Steps>
+
+This model guarantees a **global total order of events**. Every client eventually converges to the same state.
+
+## Nodes in the system
+
+LiveStore uses a three-tier hierarchy:
+
+| Node | Role |
+|---|---|
+| **Client session** | A browser tab, window, or app instance. Holds pending events in memory. |
+| **Client leader** | One session per client acts as leader. Owns the durable local event log (`dbEventLog`) and the local SQLite state (`dbState`). |
+| **Sync backend** | Central authority. Stores the canonical append-only event log and broadcasts new events to clients. |
+
+Multiple sessions within the same client (e.g. multiple browser tabs) share local data and sync across each other. Session-only events are never sent to the sync backend.
+
+## Happy path: committing an event
+
+The following trace shows how a single `todoCreated` event flows from a client session through to the backend.
+
+<AccordionGroup>
+  <Accordion title="1. Session commits event">
+    The session merges the new event `e3` into its local `SyncState` as pending. It pushes the pending event to the leader thread. The leader still shows the previous head (`e2`) until it persists the event.
+
+    ```
+    Session: e1 → e2 → e3' (pending)
+    Leader:  e1 → e2
+    Backend: e1 → e2
+    ```
+  </Accordion>
+  <Accordion title="2. Leader persists the event">
+    The leader materializes the event into its local SQLite database and writes it to the local event log. The event remains unconfirmed because the backend has not acknowledged it yet.
+
+    ```
+    Session: e1 → e2 → e3' (pending)
+    Leader:  e1 → e2 → e3' (unconfirmed)
+    Backend: e1 → e2
+    ```
+  </Accordion>
+  <Accordion title="3. Leader signals the session">
+    The leader emits the event back to subscribed sessions. The session upgrades the event from pending to confirmed while the leader still awaits backend acknowledgement.
+
+    ```
+    Session: e1 → e2 → e3 (confirmed locally)
+    Leader:  e1 → e2 → e3' (unconfirmed)
+    Backend: e1 → e2
+    ```
+  </Accordion>
+  <Accordion title="4. Backend acknowledges">
+    The leader pushes the event upstream. The backend validates, appends it, and acknowledges. All heads align.
+
+    ```
+    Session: e1 → e2 → e3
+    Leader:  e1 → e2 → e3
+    Backend: e1 → e2 → e3
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Conflict resolution: rebasing
+
+When two clients commit events concurrently, the sync backend assigns sequence numbers in the order it receives them. A client whose pending events lose the race must **rebase** its local work on top of the upstream events — similar to `git rebase`.
+
+<AccordionGroup>
+  <Accordion title="1. Divergence: client A has pending work, backend advances">
+    Client A holds pending event `A:e3` (todoRenamed). The backend has already committed `B:e3` from client B.
+
+    ```
+    Session: e1 → e2 → A:e3 (pending)
+    Leader:  e1 → e2 → A:e3' (unconfirmed)
+    Backend: e1 → e2 → B:e3
+    ```
+  </Accordion>
+  <Accordion title="2. Leader pulls upstream and detects divergence">
+    The leader compares its pending chain with upstream events and finds the divergence at `e2`. It rolls back to `e2`.
+
+    ```
+    Session: e1 → e2
+    Leader:  e1 → e2
+    Backend: e1 → e2 → B:e3
+    ```
+  </Accordion>
+  <Accordion title="3. Authoritative events are applied">
+    Both session and leader apply `B:e3` from the backend.
+
+    ```
+    Session: e1 → e2 → B:e3
+    Leader:  e1 → e2 → B:e3
+    Backend: e1 → e2 → B:e3
+    ```
+  </Accordion>
+  <Accordion title="4. Pending events are replayed on top">
+    Client A's original event is replayed with a new sequence number (`e4`), on top of the authoritative head. Its payload is unchanged; only the sequence number is updated.
+
+    ```
+    Session: e1 → e2 → B:e3 → A:e4 (pending, rebased from e3)
+    Leader:  e1 → e2 → B:e3 → A:e4' (unconfirmed)
+    Backend: e1 → e2 → B:e3
+    ```
+  </Accordion>
+  <Accordion title="5. Rebased event is pushed and confirmed">
+    The backend accepts `A:e4`. All heads align.
+
+    ```
+    Session: e1 → e2 → B:e3 → A:e4
+    Leader:  e1 → e2 → B:e3 → A:e4
+    Backend: e1 → e2 → B:e3 → A:e4
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  Rebasing is done on the client, not on the sync backend. This gives you full control over the rebase behaviour.
+</Note>
+
+## Event sequence numbers
+
+Sequence numbers track causal ordering in the event log.
+
+| Field | Description |
+|---|---|
+| `seqNum` | Globally unique integer assigned by the sync backend |
+| `parentSeqNum` | The sequence number of the parent event (establishes causal chain) |
+
+On the client, sequence numbers carry additional information:
+
+```json
+{
+  "seqNum": { "global": 5, "client": 1, "rebaseGeneration": 0 },
+  "parentSeqNum": { "global": 5, "client": 0, "rebaseGeneration": 0 }
+}
+```
+
+| Field | Description |
+|---|---|
+| `global` | Globally unique integer assigned by the backend (`EventSequenceNumber.Global`) |
+| `client` | Client-local counter; 0 for synced events, increments for client-only events |
+| `rebaseGeneration` | Increments each time the client rebases unconfirmed events |
+
+Events are written in shorthand like `e5` (global event 5), `e5.1` (client-local), or `e5r1` (after a rebase).
+
+## Client identity
+
+Each client chooses a random 6-character `clientId` (`nanoid`) as its globally unique identifier. In the rare event of a collision (detected when the client first pushes), LiveStore picks a new ID, patches local events, and retries automatically.
+
+## Sync heads
+
+The latest event in an event log is the **head** (analogous to `HEAD` in Git). Because LiveStore uses hierarchical syncing, there are three heads to track:
+
+- **Session head** — the latest event the session knows about
+- **Leader head** — the latest event in the leader's durable event log
+- **Backend head** — the latest event in the canonical backend event log
+
+## Backend reset detection
+
+When a sync backend is reset (e.g. deleting local Cloudflare state or wiping Postgres), clients with cached data may not know. LiveStore detects this using a `backendId` generated when the backend is first initialized.
+
+Configure the behaviour with `onBackendIdMismatch`:
+
+```typescript
+const store = await createStorePromise({
+  schema,
+  adapter,
+  sync: {
+    backend: yourSyncBackend,
+    onBackendIdMismatch: 'reset', // 'reset' | 'shutdown' | 'ignore'
+  },
+})
+```
+
+| Option | Behaviour |
+|---|---|
+| `'reset'` (default) | Clears local storage and shuts down. The app restarts and syncs fresh from the backend. Recommended for development. |
+| `'shutdown'` | Shuts down without clearing local storage. The stale state persists until you manually clear it. |
+| `'ignore'` | Logs the error and keeps running in offline mode with stale data. |
+
+<Tip>
+  Use `'reset'` during development whenever you wipe the sync backend state, run with a `--reset` flag, or apply schema changes that require a full re-backfill.
+</Tip>
+
+## Auth
+
+Authentication and authorization for the sync backend is handled at the transport level. Add auth headers or tokens to your sync backend connection when initializing the adapter. Refer to your sync provider's documentation for specific patterns.
+
+## Design decisions
+
+<AccordionGroup>
+  <Accordion title="Why require a central sync backend?">
+    A central backend enforces a global total order of events. Without a canonical order, clients could permanently diverge. This means LiveStore is not suitable for fully decentralized or peer-to-peer use cases.
+  </Accordion>
+  <Accordion title="Why rebase on the client?">
+    Client-side rebasing gives application developers control over the rebase process and keeps the sync backend simple and stateless with respect to individual clients. The backend only needs to append events and broadcast them; it does not need to understand business logic.
+  </Accordion>
+  <Accordion title="Why sync events rather than state?">
+    Syncing events (the event log) rather than the SQLite database means the sync layer is decoupled from the read model. You can change your SQLite schema and materializers without migrating the canonical log. The read model is always reconstructable from the event log.
+  </Accordion>
+</AccordionGroup>
+
+## Further reading
+
+- [Event sourcing overview](/concepts)
+- [Distributed Systems lecture series by Martin Kleppmann](https://www.youtube.com/playlist?list=PLeKd45zvjcDFUEv_ohr_HdUFe97RItdiB)
+- [Ordering distributed events](https://medium.com/baseds/ordering-distributed-events-29c1dd9d1eff)

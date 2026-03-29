@@ -1,0 +1,271 @@
+---
+title: '@livestore/livestore'
+description: 'Core LiveStore package. Provides store creation, schema definition, querying, signals, and the event system.'
+---
+
+`@livestore/livestore` is the core package. It provides everything needed to define a schema, create a store, run queries, and commit events.
+
+## Installation
+
+<Tabs>
+  <Tab title="npm">
+    ```bash
+    npm install @livestore/livestore
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    ```bash
+    pnpm add @livestore/livestore
+    ```
+  </Tab>
+  <Tab title="yarn">
+    ```bash
+    yarn add @livestore/livestore
+    ```
+  </Tab>
+</Tabs>
+
+## Exports
+
+### Store creation
+
+#### `createStore`
+
+Creates a `Store` imperatively. Useful outside of React (Node.js scripts, tests, Solid, etc.).
+
+```typescript
+function createStore<TSchema extends LiveStoreSchema>(
+  options: CreateStoreOptions<TSchema>,
+): Store<TSchema>
+```
+
+```typescript
+import { createStore, storeOptions } from '@livestore/livestore'
+
+const store = await createStore({
+  schema,
+  adapter,
+  storeId: 'my-app',
+})
+```
+
+#### `createStorePromise`
+
+Like `createStore` but returns a `Promise<Store>`. Use when the adapter requires async initialization.
+
+```typescript
+function createStorePromise<TSchema extends LiveStoreSchema>(
+  options: CreateStoreOptionsPromise<TSchema>,
+): Promise<Store<TSchema>>
+```
+
+#### `storeOptions`
+
+Constructs a typed `RegistryStoreOptions` object for use with `StoreRegistry` and `useStore`. Provides full TypeScript inference for the schema type.
+
+```typescript
+function storeOptions<
+  TSchema extends LiveStoreSchema,
+  TContext = {},
+  TSyncPayloadSchema extends Schema.Schema<any> = typeof Schema.JsonValue,
+>(
+  options: RegistryStoreOptions<TSchema, TContext, TSyncPayloadSchema>,
+): RegistryStoreOptions<TSchema, TContext, TSyncPayloadSchema>
+```
+
+```typescript
+import { storeOptions } from '@livestore/livestore'
+
+export const myStoreOptions = storeOptions({ schema, adapter, storeId: 'my-app' })
+```
+
+#### `StoreRegistry`
+
+Manages a collection of stores by ID. Stores are loaded on demand, cached, and released when unused.
+
+```typescript
+import { StoreRegistry } from '@livestore/livestore'
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+
+const storeRegistry = new StoreRegistry({
+  defaultOptions: { batchUpdates },
+})
+```
+
+### Schema definition
+
+#### `makeSchema`
+
+Combines events, state tables, and materializers into a `LiveStoreSchema`.
+
+```typescript
+import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+}
+
+const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+    },
+  }),
+}
+
+export const schema = makeSchema({
+  events,
+  state: State.SQLite.makeState({ tables }),
+})
+```
+
+#### `Events`
+
+Namespace for event constructors:
+
+- `Events.synced(options)` — synced across all clients via the sync backend
+- `Events.clientOnly(options)` — processed locally only, never pushed to the sync backend
+
+#### `Schema`
+
+Re-exported from [Effect Schema](https://effect.website/docs/schema/introduction) for defining event and table schemas.
+
+### Querying
+
+#### `queryDb`
+
+Creates a reactive database query. Pass the result to `useQuery`, `store.query()`, or `store.subscribe()`.
+
+```typescript
+function queryDb<T>(queryBuilder: QueryBuilder<T>): LiveQueryDef<T>
+```
+
+```typescript
+import { queryDb } from '@livestore/livestore'
+
+const activeTodos = queryDb(
+  tables.todos.query.where({ completed: false }).orderBy([{ col: 'text', direction: 'asc' }])
+)
+```
+
+#### `sql`
+
+Template literal tag for raw SQL queries. Returns a typed `QueryBuilder`.
+
+```typescript
+import { sql } from '@livestore/livestore'
+
+const result = sql`SELECT * FROM todos WHERE completed = 0`
+```
+
+### Reactive primitives
+
+#### `signal`
+
+Creates a reactive signal — a mutable value that can be queried and subscribed to.
+
+```typescript
+function signal<T>(
+  initialValue: T,
+  options?: { label?: string },
+): SignalDef<T>
+```
+
+```typescript
+import { signal } from '@livestore/livestore'
+
+const selectedId = signal<string | null>(null, { label: 'selectedId' })
+```
+
+#### `computed`
+
+Creates a derived reactive value from one or more signals or queries.
+
+```typescript
+function computed<T>(
+  compute: (get: Get) => T,
+  options?: { label?: string },
+): LiveQueryDef<T>
+```
+
+```typescript
+import { computed, signal } from '@livestore/livestore'
+
+const counter = signal(0)
+const doubled = computed((get) => get(counter) * 2)
+```
+
+### Utilities
+
+#### `nanoid`
+
+Generates a random NanoID string. Re-exported from `@livestore/utils/nanoid` for convenience.
+
+```typescript
+import { nanoid } from '@livestore/livestore'
+
+const id = nanoid() // 21-character URL-safe string
+```
+
+## Usage example
+
+```typescript
+import {
+  createStorePromise,
+  Events,
+  makeSchema,
+  nanoid,
+  queryDb,
+  Schema,
+  signal,
+  State,
+  storeOptions,
+} from '@livestore/livestore'
+
+// 1. Define events
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+}
+
+// 2. Define state tables
+const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+    },
+  }),
+}
+
+// 3. Compose the schema
+const schema = makeSchema({
+  events,
+  state: State.SQLite.makeState({ tables }),
+})
+
+// 4. Create a store
+const store = await createStorePromise({ schema, adapter, storeId: 'todos' })
+
+// 5. Query and commit
+const todos = store.query(queryDb(tables.todos.query))
+store.commit(events.todoCreated({ id: nanoid(), text: 'Buy groceries' }))
+```
+
+## Peer dependencies
+
+`@livestore/livestore` requires `effect ^3.19.19` as a peer dependency.

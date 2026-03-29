@@ -1,0 +1,281 @@
+---
+title: Devtools and debugging
+description: Install and use LiveStore DevTools to inspect state, browse the event log, trace queries, and debug sync issues.
+---
+
+LiveStore is built with debuggability in mind. The DevTools give you a live window into your store's state, event history, queries, sync status, and reactivity graph — all without adding instrumentation code.
+
+<Note>
+DevTools are available to LiveStore sponsors. See the [LiveStore GitHub repository](https://github.com/livestorejs/livestore) for details.
+</Note>
+
+## DevTools overview
+
+The DevTools panel includes the following features:
+
+<CardGroup cols={2}>
+  <Card title="Data browser" icon="table">
+    Browse and edit your SQLite tables in real time with two-way sync. Changes made in the browser reflect in the app immediately.
+  </Card>
+  <Card title="Eventlog browser" icon="list">
+    See every event committed to the store in chronological order. Filter, search, and inspect individual event payloads.
+  </Card>
+  <Card title="Query inspector" icon="magnifying-glass">
+    View all active queries, their current results, and which signals they depend on.
+  </Card>
+  <Card title="Sync status" icon="arrows-rotate">
+    Monitor the connection to the sync backend. Toggle the sync latch to simulate offline behavior.
+  </Card>
+  <Card title="Signals graph" icon="diagram-project">
+    Visualize the dependency graph of computed signals and observe which queries trigger re-renders.
+  </Card>
+  <Card title="SQLite playground" icon="terminal">
+    Run arbitrary SQL queries against the live SQLite database directly from the DevTools panel.
+  </Card>
+</CardGroup>
+
+## Installing DevTools
+
+### Web (Vite)
+
+Install the `@livestore/devtools-vite` package and add the plugin to your Vite config:
+
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    npm install --save-dev @livestore/devtools-vite
+    ```
+  </Step>
+  <Step title="Add the Vite plugin">
+    ```typescript vite.config.ts
+    import { defineConfig } from 'vite'
+    import { livestoreDevtoolsPlugin } from '@livestore/devtools-vite'
+
+    export default defineConfig({
+      // ...
+      plugins: [livestoreDevtoolsPlugin({ schemaPath: './src/livestore/schema.ts' })],
+    })
+    ```
+  </Step>
+  <Step title="Open the DevTools">
+    Run your app and navigate to `localhost:3000/_livestore/web` (or the URL logged in the browser console) to open the DevTools panel in a separate tab.
+  </Step>
+</Steps>
+
+### Chrome extension
+
+You can also use the DevTools Chrome extension instead of the Vite-served panel.
+
+<Steps>
+  <Step title="Download the extension">
+    Download the `.zip` matching your LiveStore version from the [GitHub releases page](https://github.com/livestorejs/livestore/releases). For example: `livestore-devtools-chrome-0.3.0.zip`.
+  </Step>
+  <Step title="Enable Developer mode">
+    Navigate to `chrome://extensions/` and enable **Developer mode** using the toggle in the top-right corner.
+  </Step>
+  <Step title="Load the extension">
+    Click **Load unpacked** and select the unpacked folder, or drag and drop it onto the extensions page.
+  </Step>
+</Steps>
+
+<Warning>
+Install the extension version that matches the LiveStore version you are using. Mismatched versions may cause the DevTools to malfunction.
+</Warning>
+
+### Expo (React Native)
+
+Install the `@livestore/devtools-expo` package and configure your Metro bundler:
+
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    npm install --save-dev @livestore/devtools-expo
+    ```
+  </Step>
+  <Step title="Configure Metro">
+    ```javascript metro.config.js
+    const { getDefaultConfig } = require('expo/metro-config')
+    const { addLiveStoreDevtoolsMiddleware } = require('@livestore/devtools-expo')
+
+    const config = getDefaultConfig(__dirname)
+
+    addLiveStoreDevtoolsMiddleware(config, { schemaPath: './src/livestore/schema.ts' })
+
+    module.exports = config
+    ```
+  </Step>
+  <Step title="Open the DevTools">
+    In the Expo CLI process, press `Shift+m` and select `@livestore/devtools-expo`. The DevTools panel opens in a new browser tab.
+  </Step>
+</Steps>
+
+### Node.js adapter
+
+DevTools are configured automatically for `makePersistedAdapter`. The DevTools URL is logged when the app starts.
+
+<Note>
+DevTools are not currently supported for `makeInMemoryAdapter` in the Node.js adapter.
+</Note>
+
+## Using the eventlog browser
+
+The eventlog browser is the most useful tool for debugging unexpected state.
+
+**What it shows:**
+- Every event committed to the store, in order
+- Event name, timestamp, client ID, and full payload
+- Which materializer ran for each event
+
+**How to use it:**
+1. Reproduce the bug or unexpected state in your app
+2. Open the eventlog browser
+3. Identify the event (or missing event) that caused the incorrect state
+4. Inspect the payload to confirm it contains the values you expected
+
+Because LiveStore state is deterministic from the event log, if the state is wrong, either the wrong event was committed, the payload was incorrect, or the materializer has a bug.
+
+## Using the query inspector
+
+The query inspector shows all currently active `queryDb` subscriptions and their live results.
+
+**What it shows:**
+- The SQL query string for each subscription
+- Current result set
+- Which signals the query depends on
+- Last time the query re-ran
+
+**How to use it:**
+- If a component is not updating when you expect it to, check the query inspector to confirm the query is active and returning the expected rows
+- If a component is re-rendering too often, inspect the query's signal dependencies to find unnecessary invalidations
+
+## Using the signals/reactivity graph
+
+The signals graph visualizes computed signals and their dependency chains. Each node represents a signal or query; edges represent dependencies.
+
+Use the signals graph to:
+- Find computations that have unexpectedly large dependency sets
+- Trace why a specific computation re-ran after a commit
+- Identify signals that are recomputed more often than necessary
+
+## Debugging helpers on the store
+
+The `store` object exposes a `_dev` property with helpers for programmatic debugging:
+
+```typescript
+// Access internal diagnostics
+store._dev
+
+// Example: inspect pending events
+console.log(store._dev)
+```
+
+<Note>
+The `_dev` API is intended for development and debugging use only. Do not rely on it in production code — it may change between versions.
+</Note>
+
+## `exposeDebugUtils()`
+
+In development, you can expose the store and debug utilities on the global `window` object to inspect them from the browser console:
+
+```typescript
+// In your store setup (development only)
+if (import.meta.env.DEV) {
+  exposeDebugUtils({ store })
+}
+```
+
+This allows you to run queries, inspect state, and commit test events directly from the browser console without modifying your application code.
+
+## OpenTelemetry integration
+
+LiveStore supports OpenTelemetry tracing via the `otelOptions` configuration. Traces capture store operations, event commits, materializer runs, and sync activity, giving you a detailed performance and correctness timeline.
+
+<Steps>
+  <Step title="Set up a tracer">
+    ```typescript otel.ts
+    import { ZoneContextManager } from '@opentelemetry/context-zone'
+    import { W3CTraceContextPropagator } from '@opentelemetry/core'
+    import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
+    import { resourceFromAttributes } from '@opentelemetry/resources'
+    import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
+    import { WebTracerProvider } from '@opentelemetry/sdk-trace-web'
+
+    export const makeTracer = (serviceName: string) => {
+      const url = import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT
+      const provider = new WebTracerProvider({
+        spanProcessors:
+          url !== undefined
+            ? [new SimpleSpanProcessor(new OTLPTraceExporter({ url: `${url}/v1/traces` }))]
+            : [],
+        resource: resourceFromAttributes({ 'service.name': serviceName }),
+      })
+
+      provider.register({
+        contextManager: new ZoneContextManager(),
+        propagator: new W3CTraceContextPropagator(),
+      })
+
+      return provider.getTracer('livestore')
+    }
+
+    export const tracer = makeTracer('my-app')
+    ```
+  </Step>
+  <Step title="Pass the tracer to the worker">
+    ```typescript livestore.worker.ts
+    import { makeWorker } from '@livestore/adapter-web/worker'
+    import { tracer } from './otel.ts'
+    import { schema } from './schema.ts'
+
+    makeWorker({ schema, otelOptions: { tracer } })
+    ```
+  </Step>
+  <Step title="Pass the tracer to the store">
+    ```tsx app.tsx
+    const useAppStore = () =>
+      useStore({
+        storeId: 'my-app',
+        schema,
+        adapter,
+        batchUpdates,
+        otelOptions: { tracer },
+      })
+    ```
+  </Step>
+</Steps>
+
+Traces are exported to any OTLP-compatible backend (Jaeger, Honeycomb, Grafana Tempo, and so on). Set the `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to your collector URL.
+
+## Debugging sync issues
+
+<AccordionGroup>
+  <Accordion title="Events are not syncing to other clients">
+    1. Open the **Sync status** panel in DevTools and verify the connection is active.
+    2. Check the **Eventlog browser** — confirm the events appear locally with the expected payloads.
+    3. Check your sync backend logs for `validatePayload` errors or connection rejections.
+    4. Verify your `syncPayload` auth token is valid and has not expired.
+  </Accordion>
+  <Accordion title="State is inconsistent between clients">
+    Because LiveStore state is deterministic from the event log, inconsistent state between clients means the event logs are diverging. Check:
+    1. Whether all clients are connected to the same store ID
+    2. Whether an `unknownEventHandling` strategy is silently dropping events on older clients
+    3. Whether any materializer has non-deterministic behavior (random values, timestamps, side effects)
+  </Accordion>
+  <Accordion title="Slow or missing re-renders">
+    1. Open the **Query inspector** and verify your query is active and returning updated rows
+    2. Check the **Signals graph** for unexpected dependency chains that may be missing or over-broad
+    3. Confirm you are using `useQuery` (or the equivalent for your framework) rather than reading state imperatively
+  </Accordion>
+  <Accordion title="Testing offline sync behavior">
+    Use the **sync latch** in the Sync status panel to close the sync connection without affecting the rest of the application. Commit events while offline, then re-enable the latch and verify events sync correctly.
+  </Accordion>
+</AccordionGroup>
+
+## Recommended debugging workflow
+
+1. Reproduce the issue
+2. Open the **Eventlog browser** — check that the expected events were committed with correct payloads
+3. Open the **Data browser** — check the current state of the relevant SQLite tables
+4. If state is wrong given correct events, check the materializer for that event type
+5. If events are missing, check the application code that calls `store.commit()`
+6. If sync is wrong, check the **Sync status** panel and your backend logs

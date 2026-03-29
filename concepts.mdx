@@ -1,0 +1,292 @@
+---
+title: Concepts
+description: A reference for every LiveStore concept — adapters, clients, sessions, events, schemas, reactivity, sync providers, and the leader thread.
+---
+
+LiveStore is built from a small set of well-defined concepts that compose into a complete data layer. This page defines each concept and links to the relevant deep-dive pages.
+
+## Architecture overview
+
+LiveStore has a pluggable architecture. Three extension points let you adapt it to any platform, framework, or sync backend:
+
+<CardGroup cols={3}>
+  <Card title="Platform adapters" icon="plug" href="/integrations/platform-adapters">
+    Integrate LiveStore with web browsers, Expo (React Native), Node.js, and other runtime environments.
+  </Card>
+  <Card title="Framework integrations" icon="puzzle-piece" href="/integrations/react">
+    Use LiveStore from React, Vue, Solid, Svelte, or any framework with the core store API.
+  </Card>
+  <Card title="Sync providers" icon="arrows-rotate" href="/sync-providers/cloudflare">
+    Choose or build a sync backend — Cloudflare, ElectricSQL, S2, or a custom implementation.
+  </Card>
+</CardGroup>
+
+---
+
+## Adapter (platform adapter)
+
+An **adapter** knows how to instantiate a client session for a given runtime environment. It abstracts over the differences between platforms — threading models, storage APIs, worker APIs — so the rest of LiveStore can stay platform-agnostic.
+
+Available adapters:
+
+- `@livestore/adapter-web` — browser environments (uses a Web Worker for the leader thread)
+- `@livestore/adapter-expo` — Expo / React Native (iOS, Android)
+- `@livestore/adapter-node` — Node.js (server, CLI, agent workloads)
+
+You pass an adapter when creating a store:
+
+```typescript
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+
+const adapter = makeInMemoryAdapter()
+const store = createStore({ schema, adapter, storeId: 'my-app' })
+```
+
+---
+
+## Client and client session
+
+### Client
+
+A **client** is a logical grouping of one or more client sessions. It is identified by a `clientId` — a randomly generated 6-character nanoid. Sessions within the same client share local persisted data.
+
+### Client session
+
+A **client session** is a single running instance within a client. It is identified by a `sessionId`. In a web browser, a sessionId can persist across tab reloads, and multiple tabs of the same app each have their own session within the same client.
+
+Each client session contains:
+- A **store** — the main API surface for your application
+- A **reactivity graph** — the subscription system that drives UI updates
+
+<Note>
+LiveStore does not have built-in concepts of "users" or "devices". User identity must be modeled within your application domain through events and application logic. The `clientId` identifies a client instance, not a user — multiple clients can represent the same user on different browsers or devices.
+</Note>
+
+---
+
+## Store
+
+The **store** is the main entry point for using LiveStore in your application. It exposes the `commit` method for writing events, `useQuery` for reactive reads, and access to sync status and devtools.
+
+To create a store you provide a schema and a platform adapter:
+
+```typescript
+import { createStore } from '@livestore/livestore'
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { schema } from './schema.ts'
+
+const store = createStore({ schema, adapter: makeInMemoryAdapter(), storeId: 'my-app' })
+```
+
+In practice, stores are created and managed through a framework integration (for example, `useStore` from `@livestore/react`).
+
+A store is identified by a `storeId`, which is also used when syncing events between clients — clients with the same `storeId` share the same eventlog.
+
+<CardGroup cols={2}>
+  <Card title="Store API" icon="code" href="/api/create-store">
+    Full reference for `createStore` options and the store instance API
+  </Card>
+  <Card title="React integration" icon="react" href="/integrations/react">
+    How to set up and access the store in React components
+  </Card>
+</CardGroup>
+
+---
+
+## Events and eventlog
+
+### Events
+
+**Events** are immutable facts that describe something that happened in your application — for example, `TodoCreated` or `TodoCompleted`. They are defined with a name and an [Effect Schema](https://effect.website/docs/schema/introduction/) for their payload.
+
+There are two kinds of events:
+
+| Kind | Description |
+|---|---|
+| `Events.synced` | Persisted to the eventlog and synced to other clients via the sync backend |
+| `Events.clientOnly` | Applied locally in memory only — never persisted or synced |
+
+```typescript
+import { Events, Schema } from '@livestore/livestore'
+
+const todoCreated = Events.synced({
+  name: 'v1.TodoCreated',
+  schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+})
+
+const uiFilterChanged = Events.clientOnly({
+  name: 'UiFilterChanged',
+  schema: Schema.Struct({ filter: Schema.String }),
+})
+```
+
+Use `clientOnly` events for transient UI state (selected item, open panels, filter values) that doesn't need to survive a page refresh or sync to other users.
+
+### Eventlog
+
+The **eventlog** is the ordered, append-only log of all committed synced events. It is the canonical source of truth in LiveStore. All persisted state is a projection of this log.
+
+The eventlog gives you:
+- **Persistence** — events survive page refreshes and app restarts
+- **Sync** — events replay identically on every client
+- **History** — full audit trail of every change (enables time-travel debugging)
+- **Flexibility** — change your queries without migrations by rematerializing
+
+<Card title="Events deep dive" icon="timeline" href="/core/schema-and-events">
+  Full reference for event definitions, the eventlog, naming conventions, and versioning
+</Card>
+
+---
+
+## Schema
+
+A **schema** is the complete definition of your app's data model. It is the single configuration object you pass to `makeSchema` and then to the store.
+
+A schema has three parts:
+
+<Steps>
+  <Step title="Event definitions">
+    The set of events that can happen in your app (`Events.synced` and `Events.clientOnly`).
+  </Step>
+  <Step title="State schema">
+    The SQLite tables that hold your materialized state, defined with `State.SQLite.table`.
+  </Step>
+  <Step title="Materializers">
+    Functions that map each event to a SQLite operation (insert, update, delete). Defined with `State.SQLite.materializers`.
+  </Step>
+</Steps>
+
+```typescript schema.ts
+import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+}
+
+const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+    },
+  }),
+}
+
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+export const schema = makeSchema({ events, state })
+```
+
+LiveStore uses the [Effect Schema module](https://effect.website/docs/schema/introduction/) for fine-grained type-safe schemas on both events and query results.
+
+<CardGroup cols={2}>
+  <Card title="Schema and events" icon="file-code" href="/core/schema-and-events">
+    Complete reference for defining events, tables, and the makeSchema API
+  </Card>
+  <Card title="State and materializers" icon="database" href="/core/state-and-materializers">
+    How materializers work, SQLite column types, and state derivation
+  </Card>
+</CardGroup>
+
+---
+
+## Reactivity system
+
+LiveStore's reactivity system keeps your UI in sync with the local SQLite database automatically. There are three primitives:
+
+### `queryDb`
+
+Creates a **reactive SQL query**. When any row that the query reads changes, subscribers are notified and UI components re-render.
+
+```typescript
+import { queryDb } from '@livestore/livestore'
+
+const todos$ = queryDb(() => tables.todos, { label: 'todos' })
+// In a React component:
+const todos = store.useQuery(todos$)
+```
+
+### `signal`
+
+A **signal** is a reactive primitive holding a single value. It is useful for UI state that doesn't live in SQLite (for example, the currently selected item ID).
+
+```typescript
+import { signal } from '@livestore/livestore'
+
+const selectedId$ = signal<string | null>(null, { label: 'selectedId' })
+```
+
+### `computed`
+
+A **computed** value derives a reactive value from one or more other reactive sources (queries, signals, or other computed values).
+
+```typescript
+import { computed } from '@livestore/livestore'
+
+const selectedTodo$ = computed(
+  [todos$, selectedId$],
+  ([todos, id]) => todos.find(t => t.id === id) ?? null,
+  { label: 'selectedTodo' },
+)
+```
+
+<Card title="Reactivity system deep dive" icon="bolt" href="/core/reactivity-system">
+  Full reference for queryDb, signals, computed, and the subscription model
+</Card>
+
+---
+
+## Sync provider
+
+A **sync provider** is a package that pairs a sync backend with a sync client. The sync backend is a central server that stores events and enforces a global total order. The sync client runs inside LiveStore and communicates with the backend.
+
+LiveStore ships with several sync providers:
+
+<CardGroup cols={2}>
+  <Card title="Cloudflare" icon="cloud" href="/sync-providers/cloudflare">
+    Serverless sync via Cloudflare Workers and Durable Objects (`@livestore/sync-cf`)
+  </Card>
+  <Card title="ElectricSQL" icon="bolt" href="/sync-providers/electricsql">
+    Sync powered by ElectricSQL's Postgres-based sync engine
+  </Card>
+  <Card title="S2" icon="server" href="/sync-providers/s2">
+    High-throughput sync via S2 streaming infrastructure
+  </Card>
+  <Card title="Custom" icon="wrench" href="/sync-providers/custom">
+    Build your own sync backend by implementing the LiveStore sync protocol
+  </Card>
+</CardGroup>
+
+---
+
+## Framework integration
+
+A **framework integration** is a package that provides reactive hooks and context providers for a specific UI framework. The integration manages store lifecycle (creation, cleanup) and bridges the LiveStore reactivity system to the framework's rendering model.
+
+Available integrations: React (`@livestore/react`), Vue, Solid, and Svelte.
+
+<Card title="React integration" icon="react" href="/integrations/react">
+  useStore, useQuery, and useSyncStatus for React applications
+</Card>
+
+---
+
+## Leader thread
+
+The **leader thread** is responsible for persisting events to the local eventlog, running materializers to update the persisted SQLite database, and communicating with the sync backend.
+
+In a web browser, the leader thread runs in a Web Worker. On a device with multiple open tabs, exactly one tab's worker acts as the leader at any time — the others are followers that receive updates from the leader.
+
+The **client session thread** (usually the main thread) holds an in-memory SQLite replica used by the reactivity graph for synchronous, sub-millisecond reads. Changes flow from the leader thread to the client session thread automatically.
+
+<Tip>
+You don't need to manage the leader thread directly — the platform adapter handles this for you. Understanding it helps when debugging multi-tab behavior or performance characteristics.
+</Tip>

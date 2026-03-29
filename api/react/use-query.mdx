@@ -1,0 +1,227 @@
+---
+title: 'useQuery'
+description: 'Subscribe to reactive LiveStore queries in React components. Re-renders automatically when query results change.'
+---
+
+`useQuery` runs a query against the LiveStore database and subscribes the component to future updates. The component re-renders whenever the query result changes.
+
+## Function signature
+
+```typescript
+function useQuery<TQueryable extends Queryable<any>>(
+  queryable: TQueryable,
+  options?: { store?: Store },
+): Queryable.Result<TQueryable>
+```
+
+The return type is inferred from the queryable — if you pass a `queryDb(tables.todos.query)`, you get back `Todo[]`.
+
+## Parameters
+
+<ParamField path="queryable" type="TQueryable" required>
+  The query to run. Accepts any `Queryable<TResult>`:
+
+  - A `LiveQueryDef` created with `queryDb()`
+  - A `SignalDef` created with `signal()`
+  - A `ComputedDef` created with `computed()`
+  - A SQL `QueryBuilder` from a table definition
+
+  Unions of queryables are supported and the result type is inferred via `Queryable.Result<TQueryable>`.
+</ParamField>
+
+<ParamField path="options.store" type="Store">
+  The store instance to query against. Required when calling `useQuery` directly from `@livestore/react`.
+
+  You do not need to pass this when using `store.useQuery()` — the store is provided automatically.
+</ParamField>
+
+## Return value
+
+<ResponseField name="result" type="Queryable.Result<TQueryable>">
+  The current query result. For `queryDb()` queries this is typically `T[]` or `T | undefined` depending on the query.
+  For signals and computed values it is the signal's current value.
+
+  The result is synchronously populated on the first render (no loading state needed).
+</ResponseField>
+
+## Usage
+
+### Basic query
+
+```typescript
+import { useQuery } from '@livestore/react'
+import { queryDb } from '@livestore/livestore'
+import { tables } from './schema'
+
+function TodoList() {
+  const todos = useQuery(queryDb(tables.todos.query))
+
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id}>{todo.text}</li>
+      ))}
+    </ul>
+  )
+}
+```
+
+### Query via the store instance
+
+When you have a store from `useStore`, call `store.useQuery()` to avoid passing `options.store` explicitly:
+
+```typescript
+function TodoList() {
+  const store = useStore(todoStoreOptions)
+  const todos = store.useQuery(queryDb(tables.todos.query))
+
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id}>{todo.text}</li>
+      ))}
+    </ul>
+  )
+}
+```
+
+### Parameterized query
+
+Pass reactive values into the query definition. React re-creates the `queryDb` value when the deps change, and `useQuery` picks up the new query automatically:
+
+```typescript
+function FilteredTodos({ filter }: { filter: 'all' | 'active' | 'completed' }) {
+  const store = useStore(todoStoreOptions)
+
+  const todos = store.useQuery(
+    queryDb(
+      filter === 'all'
+        ? tables.todos.query
+        : tables.todos.query.where({ completed: filter === 'completed' })
+    )
+  )
+
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id}>{todo.text}</li>
+      ))}
+    </ul>
+  )
+}
+```
+
+### Conditional query
+
+Skip the query entirely by returning a fallback when the condition is false:
+
+```typescript
+function IssueDetail({ issueId }: { issueId: string | null }) {
+  const store = useStore(issueStoreOptions)
+
+  const issue = store.useQuery(
+    queryDb(
+      issueId !== null
+        ? tables.issues.query.where({ id: issueId }).first()
+        : tables.issues.query.where({ id: '__never__' }).first()
+    )
+  )
+
+  if (issue === undefined) return <p>No issue selected.</p>
+  return <h2>{issue.title}</h2>
+}
+```
+
+### Querying a signal
+
+`useQuery` works with signals and computed values as well as SQL queries:
+
+```typescript
+import { signal } from '@livestore/livestore'
+
+const counterSignal = signal(0, { label: 'counter' })
+
+function Counter() {
+  const store = useStore(myStoreOptions)
+  const count = store.useQuery(counterSignal)
+
+  return <p>Count: {count}</p>
+}
+```
+
+---
+
+## useQueryRef
+
+`useQueryRef` is the lower-level variant that returns the query result wrapped in a React ref alongside the underlying `LiveQuery` instance. Use it when you need to access the latest value without triggering an additional render (for example, in event handlers).
+
+### Function signature
+
+```typescript
+function useQueryRef<TQueryable extends Queryable<any>>(
+  queryable: TQueryable,
+  options?: {
+    store?: Store
+    otelContext?: otel.Context
+    otelSpanName?: string
+  },
+): {
+  valueRef: React.RefObject<Queryable.Result<TQueryable>>
+  queryRcRef: LiveQueries.RcRef<LiveQuery<Queryable.Result<TQueryable>>>
+}
+```
+
+### Parameters
+
+<ParamField path="queryable" type="TQueryable" required>
+  Same as `useQuery`.
+</ParamField>
+
+<ParamField path="options.store" type="Store">
+  Same as `useQuery`.
+</ParamField>
+
+<ParamField path="options.otelContext" type="otel.Context">
+  Optional parent OpenTelemetry context for the query span.
+</ParamField>
+
+<ParamField path="options.otelSpanName" type="string">
+  Optional explicit span name. Defaults to `LiveStore:useQuery:{label}`.
+</ParamField>
+
+### Return value
+
+<ResponseField name="valueRef" type="React.RefObject<Queryable.Result<TQueryable>>">
+  A React ref whose `current` always holds the latest query result. Reading `valueRef.current` inside an event handler gives you the current value without causing a stale closure issue.
+</ResponseField>
+
+<ResponseField name="queryRcRef" type="LiveQueries.RcRef<LiveQuery<Queryable.Result<TQueryable>>>">
+  The underlying reference-counted `LiveQuery` instance. This is an implementation detail used by advanced integrations.
+</ResponseField>
+
+### Example
+
+```typescript
+function SearchBox() {
+  const store = useStore(myStoreOptions)
+  const { valueRef } = useQueryRef(queryDb(tables.todos.query), { store })
+
+  const handleExport = () => {
+    // Read the latest value without being in the render cycle
+    const todos = valueRef.current
+    console.log('Exporting', todos.length, 'todos')
+  }
+
+  return <button onClick={handleExport}>Export</button>
+}
+```
+
+<Note>
+  Do not mutate the result returned by `useQuery` or held in `valueRef.current`. LiveStore shares the result object internally — mutating it can cause reactivity bugs.
+</Note>
+
+## How reactivity works
+
+Each call to `useQuery` creates or reuses a reference-counted `LiveQuery` instance. The query runs synchronously on the first render so there is never a loading flash. LiveStore then subscribes to future updates and calls `setValue` when the result changes. The component re-renders only if the new value is deeply unequal to the previous one (`deepEqual` comparison).
+
+When the component unmounts the reference count is decremented. LiveStore disposes the query when the count reaches zero.

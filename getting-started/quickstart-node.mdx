@@ -1,0 +1,224 @@
+---
+title: "Quickstart: Node.js"
+description: "Use LiveStore in a Node.js process with file-system-persisted SQLite state."
+---
+
+<Info>
+  LiveStore requires Node.js 18 or higher. Bun 1.2+ is also supported and
+  recommended for faster installs.
+</Info>
+
+<Steps>
+
+<Step title="Install packages">
+
+Install the core LiveStore package and the Node adapter:
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/livestore @livestore/adapter-node
+```
+
+```bash pnpm
+pnpm add @livestore/livestore @livestore/adapter-node
+```
+
+```bash yarn
+yarn add @livestore/livestore @livestore/adapter-node
+```
+
+```bash bun
+bun add @livestore/livestore @livestore/adapter-node
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Define your schema">
+
+Create `src/livestore/schema.ts`. The schema declares your events, SQLite tables, and materializers.
+
+```typescript src/livestore/schema.ts
+import { Events, makeSchema, Schema, State } from '@livestore/livestore'
+
+// SQLite tables hold derived state
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+      deletedAt: State.SQLite.integer({ nullable: true, schema: Schema.DateFromNumber }),
+    },
+  }),
+}
+
+// Events describe all data changes
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoUncompleted: Events.synced({
+    name: 'v1.TodoUncompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Date }),
+  }),
+}
+
+// Materializers map events onto table mutations
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+  'v1.TodoUncompleted': ({ id }) => tables.todos.update({ completed: false }).where({ id }),
+  'v1.TodoDeleted': ({ id, deletedAt }) => tables.todos.update({ deletedAt }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+
+export const schema = makeSchema({ events, state })
+```
+
+</Step>
+
+<Step title="Create and use the store">
+
+Use `createStorePromise` to create a store instance. The Node adapter stores the SQLite databases on the file system.
+
+```typescript src/main.ts
+import { makeAdapter } from '@livestore/adapter-node'
+import { createStorePromise } from '@livestore/livestore'
+
+import { events, schema, tables } from './livestore/schema.ts'
+
+const main = async () => {
+  const adapter = makeAdapter({
+    storage: { type: 'fs', baseDirectory: 'tmp' },
+  })
+
+  const store = await createStorePromise({
+    adapter,
+    schema,
+    storeId: 'my-store',
+  })
+
+  // Commit an event
+  store.commit(events.todoCreated({ id: crypto.randomUUID(), text: 'Buy groceries' }))
+
+  // Query the current state
+  const todos = store.query(tables.todos)
+  console.log('todos:', todos)
+
+  await store.shutdownPromise()
+}
+
+main().catch(console.error)
+```
+
+The `baseDirectory` option sets the directory where LiveStore writes its SQLite files. The directory is created automatically if it does not exist.
+
+</Step>
+
+</Steps>
+
+## Minimal example
+
+The following is a self-contained script you can run directly:
+
+```typescript
+import { makeAdapter } from '@livestore/adapter-node'
+import { createStorePromise } from '@livestore/livestore'
+
+import { schema, tables } from './livestore/schema.ts'
+
+const adapter = makeAdapter({
+  storage: { type: 'fs' },
+})
+
+const main = async () => {
+  const store = await createStorePromise({ adapter, schema, storeId: 'demo-store' })
+
+  const todos = store.query(tables.todos)
+  console.log(todos)
+}
+
+main().catch(() => undefined)
+```
+
+## Add sync with Cloudflare (optional)
+
+Install the sync package:
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/sync-cf
+```
+
+```bash pnpm
+pnpm add @livestore/sync-cf
+```
+
+```bash yarn
+yarn add @livestore/sync-cf
+```
+
+```bash bun
+bun add @livestore/sync-cf
+```
+
+</CodeGroup>
+
+Pass a sync backend when creating the adapter:
+
+```typescript src/main.ts
+import { makeAdapter } from '@livestore/adapter-node'
+import { createStorePromise } from '@livestore/livestore'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+import { events, schema, tables } from './livestore/schema.ts'
+
+const main = async () => {
+  const adapter = makeAdapter({
+    storage: { type: 'fs', baseDirectory: 'tmp' },
+    sync: {
+      backend: makeWsSync({ url: 'ws://localhost:8787' }),
+      onSyncError: 'shutdown',
+    },
+  })
+
+  const store = await createStorePromise({
+    adapter,
+    schema,
+    storeId: process.env.STORE_ID ?? 'my-store',
+    syncPayloadSchema: /* your payload schema */,
+    syncPayload: { authToken: 'your-token' },
+  })
+
+  store.commit(events.todoCreated({ id: crypto.randomUUID(), text: 'Synced task' }))
+
+  const todos = store.query(tables.todos)
+  console.log('todos:', todos)
+
+  // Allow sync to complete before shutting down
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+  await store.shutdownPromise()
+}
+
+main().catch(console.error)
+```
+
+<Tip>
+  See the [node-todomvc-sync-cf](https://github.com/livestorejs/livestore/tree/main/examples/node-todomvc-sync-cf)
+  example for a complete working app including the Cloudflare Worker backend.
+</Tip>

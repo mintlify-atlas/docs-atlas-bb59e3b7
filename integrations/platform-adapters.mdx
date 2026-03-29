@@ -1,0 +1,545 @@
+---
+title: Platform adapters
+description: Configure LiveStore for web browsers, Expo / React Native, Node.js, and Cloudflare Durable Objects using the appropriate platform adapter.
+---
+
+Platform adapters connect LiveStore to the underlying storage and runtime for each environment. Choose the adapter that matches your deployment target.
+
+## Adapter comparison
+
+| Adapter | Platform | Persistence | Sync support |
+|---|---|---|---|
+| `@livestore/adapter-web` | Browser | OPFS (persisted) or in-memory | Yes |
+| `@livestore/adapter-expo` | iOS / Android (Expo) | Native SQLite via `expo-sqlite` | Yes |
+| `@livestore/adapter-node` | Node.js, Bun, Deno | Filesystem or in-memory | Yes |
+| `@livestore/adapter-cloudflare` | Cloudflare Workers + Durable Objects | Durable Object SQLite | Via `@livestore/sync-cf` |
+
+---
+
+## Web adapter
+
+The web adapter runs LiveStore in the browser using a dedicated web worker and WASM-based SQLite via OPFS.
+
+### Installation
+
+```bash
+npm install @livestore/adapter-web @livestore/wa-sqlite
+```
+
+### Persisted storage (OPFS)
+
+<Steps>
+  <Step title="Create a worker file">
+    Create a dedicated worker file that registers your schema:
+
+    ```typescript livestore.worker.ts
+    import { makeWorker } from '@livestore/adapter-web/worker'
+    import { schema } from './schema.ts'
+
+    makeWorker({ schema })
+    ```
+  </Step>
+  <Step title="Create the adapter">
+    In your app entry point, create the persisted adapter and pass both the dedicated worker and the shared worker:
+
+    ```typescript main.ts
+    import { makePersistedAdapter } from '@livestore/adapter-web'
+    import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+    import LiveStoreWorker from './livestore.worker.ts?worker'
+
+    const adapter = makePersistedAdapter({
+      storage: { type: 'opfs' },
+      worker: LiveStoreWorker,
+      sharedWorker: LiveStoreSharedWorker,
+    })
+    ```
+  </Step>
+</Steps>
+
+### Adding sync
+
+Pass a sync backend to the worker:
+
+```typescript livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { makeWsSync } from '@livestore/sync-cf/client'
+import { schema } from './schema.ts'
+
+makeWorker({ schema, sync: { backend: makeWsSync({ url: 'ws://localhost:8787' }) } })
+```
+
+### In-memory storage
+
+Use the in-memory adapter for testing or scenarios where persistence is not needed:
+
+```typescript
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+
+const adapter = makeInMemoryAdapter()
+```
+
+### Single-tab mode
+
+Android Chrome does not support `SharedWorker`. LiveStore automatically falls back to single-tab mode on Android Chrome. You can also opt in explicitly:
+
+```typescript main.ts
+import { makeSingleTabAdapter } from '@livestore/adapter-web'
+import LiveStoreWorker from './livestore.worker.ts?worker'
+
+// Use only when you specifically need single-tab mode.
+// Prefer makePersistedAdapter which auto-detects SharedWorker support.
+const adapter = makeSingleTabAdapter({
+  worker: LiveStoreWorker,
+  storage: { type: 'opfs' },
+})
+```
+
+### Resetting persistence
+
+During development, you can clear local state on startup:
+
+```typescript
+const adapter = makePersistedAdapter({
+  storage: { type: 'opfs' },
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+  resetPersistence: true, // clears local OPFS data on startup
+})
+```
+
+<Warning>
+Resetting persistence only clears on-device data. It does not affect any connected sync backend. Disable this flag in production.
+</Warning>
+
+### Storage and private browsing
+
+LiveStore persists data to OPFS. In Safari and Firefox private browsing mode, OPFS is unavailable and LiveStore falls back to in-memory storage automatically. Sync still works in this fallback mode; data is just not saved across reloads.
+
+Detect the current storage mode via `store.storageMode`:
+
+```typescript
+if (store.storageMode === 'in-memory') {
+  // warn the user that data won't persist
+}
+```
+
+### Worker architecture
+
+The web adapter uses two workers:
+
+- **Dedicated web worker** (leader worker) — acts as the single writer for storage and handles the sync backend connection. Required for synchronous OPFS access.
+- **Shared worker** — acts as a proxy between browser tabs, enabling multi-tab synchronization via a binary message channel.
+
+<Note>
+Make sure your schema file does not import code that runs on the main thread (such as React components). If needed, add `import '@livestore/adapter-web/worker-vite-dev-polyfill'` to your worker file as a workaround.
+</Note>
+
+### Browser requirements
+
+Required browser APIs: OPFS, `navigator.locks`, WebAssembly. SharedWorker is used for multi-tab sync but is not strictly required (single-tab mode is the fallback).
+
+**Bundle size**: approximately 180 KB (LiveStore, gzipped) + 300 KB (SQLite WASM, gzipped).
+
+---
+
+## Expo adapter
+
+The Expo adapter enables LiveStore in React Native apps built with Expo. It uses native SQLite via `expo-sqlite` for high-performance local storage on iOS and Android.
+
+### Requirements
+
+- Expo New Architecture (Fabric) must be enabled
+- `expo-sqlite` ^16.0.0
+- `expo-application` ^7.0.0
+
+<Note>
+Expo Web is not currently supported.
+</Note>
+
+### Installation
+
+```bash
+npm install @livestore/adapter-expo @livestore/livestore @livestore/react expo-sqlite expo-application
+```
+
+### Basic setup
+
+```tsx App.tsx
+import { Suspense, useState } from 'react'
+import { unstable_batchedUpdates as batchUpdates, SafeAreaView, Text } from 'react-native'
+import { makePersistedAdapter } from '@livestore/adapter-expo'
+import { queryDb, StoreRegistry } from '@livestore/livestore'
+import { StoreRegistryProvider, useStore } from '@livestore/react'
+import { schema, tables } from './schema.ts'
+
+const adapter = makePersistedAdapter()
+
+const useAppStore = () =>
+  useStore({
+    storeId: 'my-app',
+    schema,
+    adapter,
+    batchUpdates,
+  })
+
+export const App = () => {
+  const [storeRegistry] = useState(() => new StoreRegistry())
+  return (
+    <SafeAreaView style={{ flex: 1 }}>
+      <Suspense fallback={<Text>Loading...</Text>}>
+        <StoreRegistryProvider storeRegistry={storeRegistry}>
+          <TodoList />
+        </StoreRegistryProvider>
+      </Suspense>
+    </SafeAreaView>
+  )
+}
+
+const TodoList = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(queryDb(tables.todos.select()))
+  return <Text>{todos.length} todos</Text>
+}
+```
+
+### Configuration options
+
+```typescript adapter.ts
+import { makePersistedAdapter } from '@livestore/adapter-expo'
+
+const adapter = makePersistedAdapter({
+  storage: {
+    // Optional: subdirectory relative to the default SQLite directory
+    subDirectory: 'my-app',
+  },
+})
+```
+
+| Option | Type | Description |
+|---|---|---|
+| `storage.directory` | `string` | Base directory for database files |
+| `storage.subDirectory` | `string` | Subdirectory relative to `directory` |
+| `sync` | `SyncOptions` | Sync backend configuration |
+| `clientId` | `string` | Custom client identifier (defaults to device ID) |
+| `sessionId` | `string` | Session identifier (defaults to `'static'`) |
+| `resetPersistence` | `boolean` | Clear local databases on startup (development only) |
+
+### Adding sync
+
+```typescript
+import { makePersistedAdapter } from '@livestore/adapter-expo'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+const adapter = makePersistedAdapter({
+  sync: { backend: makeWsSync({ url: 'wss://your-sync-backend.com' }) },
+})
+```
+
+### Android cleartext traffic
+
+Android blocks `http://` and `ws://` connections by default. For local development against a non-HTTPS sync backend, install `expo-build-properties` and configure `app.json`:
+
+```json app.json
+{
+  "expo": {
+    "plugins": [
+      ["expo-build-properties", { "android": { "usesCleartextTraffic": true } }]
+    ]
+  }
+}
+```
+
+### Architecture
+
+The Expo adapter runs LiveStore directly in the main JavaScript thread, using native SQLite bindings from `expo-sqlite`. This differs from the web adapter, which offloads work to a web worker.
+
+---
+
+## Node.js adapter
+
+The Node.js adapter runs LiveStore on the server or in CLI tools. It works with Node.js, Bun, and Deno.
+
+### Installation
+
+```bash
+npm install @livestore/adapter-node @livestore/livestore
+```
+
+### Basic setup
+
+```typescript adapter.ts
+import { makeAdapter } from '@livestore/adapter-node'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+const adapter = makeAdapter({
+  storage: { type: 'fs' },
+  // or in-memory:
+  // storage: { type: 'in-memory' },
+  sync: { backend: makeWsSync({ url: 'ws://localhost:8787' }) },
+  // To enable devtools:
+  // devtools: { schemaPath: new URL('./schema.ts', import.meta.url) },
+})
+```
+
+### Resetting persistence
+
+During development, clear local state on startup:
+
+```typescript
+import { makeAdapter } from '@livestore/adapter-node'
+
+const adapter = makeAdapter({
+  storage: { type: 'fs' },
+  resetPersistence: true,
+})
+```
+
+<Warning>
+This deletes all local data for the given `storeId` and `clientId`. It does not reset any connected sync backend. Only enable this during development.
+</Warning>
+
+### Worker adapter
+
+For advanced scenarios where you want to offload persistence and sync to a worker thread, use `makeWorkerAdapter`:
+
+<CodeGroup>
+
+```typescript main.ts
+import { makeWorkerAdapter } from '@livestore/adapter-node'
+
+const adapter = makeWorkerAdapter({
+  storage: { type: 'fs' },
+  workerUrl: new URL('./livestore.worker.js', import.meta.url),
+})
+```
+
+```typescript livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-node/worker'
+import { makeWsSync } from '@livestore/sync-cf/client'
+import { schema } from './schema.ts'
+
+makeWorker({
+  schema,
+  sync: { backend: makeWsSync({ url: 'ws://localhost:8787' }) },
+})
+```
+
+</CodeGroup>
+
+### Worker logging
+
+Control log output in the worker:
+
+```typescript livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-node/worker'
+import { Logger, LogLevel } from '@livestore/utils/effect'
+import { schema } from './schema.ts'
+
+makeWorker({
+  schema,
+  logger: Logger.prettyWithThread('livestore-node-leader-thread'),
+  logLevel: LogLevel.Info, // None | Error | Warning | Info | Debug
+})
+```
+
+Use `LogLevel.None` to silence output in tests. Use the default `Debug` level when diagnosing issues.
+
+---
+
+## Cloudflare Durable Object adapter
+
+The Cloudflare adapter runs LiveStore inside Cloudflare Durable Objects, enabling stateful real-time applications on the Cloudflare Workers platform.
+
+### Installation
+
+```bash
+npm install @livestore/adapter-cloudflare @livestore/sync-cf
+```
+
+### Wrangler configuration
+
+Configure your `wrangler.toml` with the required Durable Object bindings:
+
+```toml wrangler.toml
+name = "my-livestore-app"
+main = "./src/worker.ts"
+compatibility_date = "2025-05-07"
+compatibility_flags = [
+  "enable_request_signal",
+]
+
+[[durable_objects.bindings]]
+name = "SYNC_BACKEND_DO"
+class_name = "SyncBackendDO"
+
+[[durable_objects.bindings]]
+name = "CLIENT_DO"
+class_name = "LiveStoreClientDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncBackendDO", "LiveStoreClientDO"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "my-livestore-db"
+database_id = "your-database-id"
+```
+
+### Setup
+
+<Steps>
+  <Step title="Define environment types">
+    Define your Worker bindings for TypeScript:
+
+    ```typescript env.ts
+    import type { ClientDoWithRpcCallback } from '@livestore/adapter-cloudflare'
+    import type { CfTypes, SyncBackendRpcInterface } from '@livestore/sync-cf/cf-worker'
+
+    export type Env = {
+      CLIENT_DO: CfTypes.DurableObjectNamespace<ClientDoWithRpcCallback>
+      SYNC_BACKEND_DO: CfTypes.DurableObjectNamespace<SyncBackendRpcInterface>
+      DB: CfTypes.D1Database
+    }
+    ```
+  </Step>
+  <Step title="Create the sync backend Durable Object">
+    The sync backend handles event distribution between clients:
+
+    ```typescript sync-backend.ts
+    import * as SyncBackend from '@livestore/sync-cf/cf-worker'
+
+    export class SyncBackendDO extends SyncBackend.makeDurableObject({
+      // Optional: handle push events
+      // onPush: async (message, { storeId }) => {
+      //   console.log(`onPush for store (${storeId})`, message.batch)
+      // },
+    }) {}
+    ```
+  </Step>
+  <Step title="Create the client Durable Object">
+    Each client Durable Object hosts a LiveStore instance and exposes DO RPC callbacks:
+
+    ```typescript client-do.ts
+    /// <reference types="@cloudflare/workers-types" />
+    import { DurableObject } from 'cloudflare:workers'
+    import { type ClientDoWithRpcCallback, createStoreDoPromise } from '@livestore/adapter-cloudflare'
+    import { nanoid, type Store, type Unsubscribe } from '@livestore/livestore'
+    import { handleSyncUpdateRpc } from '@livestore/sync-cf/client'
+    import type { Env } from './env.ts'
+    import { schema, tables } from './schema.ts'
+    import { storeIdFromRequest } from './shared.ts'
+
+    export class LiveStoreClientDO extends DurableObject<Env> implements ClientDoWithRpcCallback {
+      override __DURABLE_OBJECT_BRAND: never = undefined as never
+
+      private storeId: string | undefined
+      private cachedStore: Store<typeof schema> | undefined
+      private storeSubscription: Unsubscribe | undefined
+      private readonly todosQuery = tables.todos.select()
+
+      override async fetch(request: Request): Promise<Response> {
+        this.storeId = storeIdFromRequest(request)
+        const store = await this.getStore()
+        const todos = store.query(this.todosQuery)
+        return new Response(JSON.stringify(todos, null, 2), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      private async getStore() {
+        if (this.cachedStore !== undefined) return this.cachedStore
+
+        const storeId = this.storeId ?? nanoid()
+        const store = await createStoreDoPromise({
+          schema,
+          storeId,
+          clientId: 'client-do',
+          sessionId: nanoid(),
+          durableObject: {
+            ctx: this.ctx,
+            env: this.env,
+            bindingName: 'CLIENT_DO',
+          },
+          syncBackendStub: this.env.SYNC_BACKEND_DO.get(
+            this.env.SYNC_BACKEND_DO.idFromName(storeId)
+          ),
+          livePull: true,
+        })
+        this.cachedStore = store
+        return store
+      }
+
+      async syncUpdateRpc(payload: unknown) {
+        await handleSyncUpdateRpc(payload)
+      }
+    }
+    ```
+  </Step>
+  <Step title="Set up the worker fetch handler">
+    Route incoming requests to the sync backend or client Durable Object:
+
+    ```typescript worker.ts
+    import type { CfTypes } from '@livestore/sync-cf/cf-worker'
+    import * as SyncBackend from '@livestore/sync-cf/cf-worker'
+    import type { Env } from './env.ts'
+    import { storeIdFromRequest } from './shared.ts'
+
+    export default {
+      fetch: async (request: CfTypes.Request, env: Env, ctx: CfTypes.ExecutionContext) => {
+        const url = new URL(request.url)
+
+        const searchParams = SyncBackend.matchSyncRequest(request)
+        if (searchParams !== undefined) {
+          return SyncBackend.handleSyncRequest({
+            request, searchParams, env, ctx,
+            syncBackendBinding: 'SYNC_BACKEND_DO',
+            headers: {},
+          })
+        }
+
+        if (url.pathname.endsWith('/client-do') === true) {
+          const storeId = storeIdFromRequest(request)
+          const id = env.CLIENT_DO.idFromName(storeId)
+          return env.CLIENT_DO.get(id).fetch(request)
+        }
+
+        return new Response('Not found', { status: 404 }) as unknown as CfTypes.Response
+      },
+    } satisfies SyncBackend.CFWorker<Env>
+    ```
+  </Step>
+</Steps>
+
+### API reference
+
+#### `createStoreDoPromise(options)`
+
+Creates a LiveStore instance inside a Durable Object.
+
+| Option | Description |
+|---|---|
+| `schema` | LiveStore schema definition |
+| `storeId` | Unique identifier for the store |
+| `clientId` | Client identifier |
+| `sessionId` | Session identifier (use `nanoid()`) |
+| `durableObject.ctx` | Durable Object state handle |
+| `durableObject.env` | Environment bindings |
+| `durableObject.bindingName` | Binding name used to reach this Durable Object |
+| `syncBackendStub` | Durable Object stub for the sync backend |
+| `livePull` | Enable push-based live updates (default: `false`) |
+| `resetPersistence` | Drop persistence before booting (development only) |
+| `logger` | Optional Effect logger layer |
+| `logLevel` | Optional minimum log level |
+
+#### `syncUpdateRpc(payload)`
+
+Client Durable Objects must implement this method so the sync backend can deliver live updates. Forward the payload to `handleSyncUpdateRpc` from `@livestore/sync-cf/client`.
+
+### Resetting persistence
+
+To wipe Durable Object databases during development, enable `resetPersistence` in `createStoreDoPromise` and guard it behind a protected route or admin token.
+
+<Warning>
+Resetting persistence deletes all LiveStore state and eventlog data in the Durable Object. Never expose this to production traffic.
+</Warning>

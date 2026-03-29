@@ -1,0 +1,165 @@
+---
+title: Vue integration
+description: Integrate LiveStore with Vue using composables for reactive queries, client documents, and event commits via the vue-livestore package.
+---
+
+The [`vue-livestore`](https://github.com/slashv/vue-livestore) package provides Vue bindings for LiveStore. It is currently in beta and aims for feature parity with the React integration.
+
+## Installation
+
+<Steps>
+  <Step title="Install packages">
+    ```bash
+    npm install vue-livestore @livestore/livestore @livestore/adapter-web @livestore/wa-sqlite
+    ```
+  </Step>
+  <Step title="Define your schema">
+    Create a schema file that defines your events, tables, and materializers:
+
+    ```typescript schema.ts
+    import { defineMaterializer, Events, makeSchema, Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+    export const tables = {
+      todos: State.SQLite.table({
+        name: 'todos',
+        columns: {
+          id: State.SQLite.text({ primaryKey: true }),
+          text: State.SQLite.text(),
+          completed: State.SQLite.boolean({ default: false }),
+          createdAt: State.SQLite.datetime(),
+        },
+      }),
+      uiState: State.SQLite.clientDocument({
+        name: 'UiState',
+        schema: Schema.Struct({
+          newTodoText: Schema.String,
+          filter: Schema.Literal('all', 'active', 'completed'),
+        }),
+        default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+      }),
+    } as const
+
+    export const events = {
+      todoCreated: Events.synced({
+        name: 'v1.TodoCreated',
+        schema: Schema.Struct({ id: Schema.String, text: Schema.String, createdAt: Schema.Date }),
+      }),
+    } as const
+
+    const materializers = State.SQLite.materializers(events, {
+      [events.todoCreated.name]: defineMaterializer(events.todoCreated, ({ id, text, createdAt }) =>
+        tables.todos.insert({ id, text, completed: false, createdAt }),
+      ),
+    })
+
+    const state = State.SQLite.makeState({ tables, materializers })
+    export const schema = makeSchema({ events, state })
+    ```
+  </Step>
+</Steps>
+
+## Setting up the provider
+
+Wrap your application in `<LiveStoreProvider>` and pass a store configuration object. The provider's `#loading` slot renders while the store is initializing.
+
+```vue App.vue
+<script setup lang="ts">
+import { makeInMemoryAdapter } from '@livestore/adapter-web'
+import { schema } from './schema.ts'
+
+const adapter = makeInMemoryAdapter()
+const storeId = 'demo-store'
+const options = { schema, adapter, storeId }
+</script>
+
+<template>
+  <LiveStoreProvider :options="options">
+    <template #loading>
+      <div>Loading LiveStore...</div>
+    </template>
+    <slot />
+  </LiveStoreProvider>
+</template>
+```
+
+## Committing events
+
+Use `useStore()` to access the store instance and call `store.commit()` to dispatch events.
+
+```typescript use-store.ts
+import { useStore } from 'vue-livestore'
+import { events } from './schema.ts'
+
+export const createTodo = () => {
+  const { store } = useStore()
+
+  store.commit(events.todoCreated({ id: crypto.randomUUID(), text: 'Eat broccoli', createdAt: new Date() }))
+}
+```
+
+## Querying data reactively
+
+Use `useQuery()` to subscribe to reactive queries. The result is a reactive ref that updates automatically when the underlying data changes.
+
+```vue TodoList.vue
+<script setup lang="ts">
+import { queryDb } from '@livestore/livestore'
+import { useQuery } from 'vue-livestore'
+import { tables } from './schema.ts'
+
+const visibleTodos$ = queryDb(() => tables.todos.where({ completed: false }), { label: 'visibleTodos' })
+
+const todos = useQuery(visibleTodos$)
+</script>
+
+<template>
+  <div>
+    <ul>
+      <li v-for="todo in todos" :key="todo.id">
+        {{ todo.text }}
+      </li>
+    </ul>
+  </div>
+</template>
+```
+
+## Client documents
+
+Use `useClientDocument()` to bind client-only state to reactive refs. Unlike synced tables, client document fields are local to the device and not shared with other clients.
+
+The composable destructures the client document fields into individual writable refs, which you can bind directly to `v-model`.
+
+```vue UiControls.vue
+<script setup lang="ts">
+import { useClientDocument } from 'vue-livestore'
+import { tables } from './schema.ts'
+
+const { newTodoText, filter } = useClientDocument(tables.uiState)
+</script>
+
+<template>
+  <div>
+    <input type="text" v-model="newTodoText" />
+
+    <select v-model="filter">
+      <option value="all">All</option>
+      <option value="active">Active</option>
+      <option value="completed">Completed</option>
+    </select>
+  </div>
+</template>
+```
+
+<Warning>
+The interface for `useClientDocument` is experimental and may change in future releases.
+</Warning>
+
+## Framework compatibility
+
+**Vite**: Works out of the box.
+
+**Nuxt.js**: Works with Nuxt when SSR is disabled. Wrap your main content in `<LiveStoreProvider>` inside a client-only component.
+
+## Technical notes
+
+- `vue-livestore` uses the provider component pattern (similar to the React integration) rather than a Vue plugin. This approach may change in a future release if the plugin pattern proves better suited for Nuxt support and multi-store scenarios.

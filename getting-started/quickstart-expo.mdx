@@ -1,0 +1,377 @@
+---
+title: "Quickstart: Expo"
+description: "Add LiveStore to an Expo app with persisted SQLite state on iOS and Android."
+---
+
+<Info>
+  LiveStore requires Expo's **New Architecture** (Fabric + TurboModules). Make
+  sure your project has it enabled before continuing — see the
+  [Expo guide](https://docs.expo.dev/guides/new-architecture/) for setup
+  instructions.
+</Info>
+
+<Steps>
+
+<Step title="Install packages">
+
+Install the LiveStore core, the Expo adapter, and the React bindings. Also install `expo-sqlite`, which the adapter uses for on-device persistence.
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/livestore @livestore/adapter-expo @livestore/react @livestore/peer-deps expo-sqlite
+```
+
+```bash pnpm
+pnpm add @livestore/livestore @livestore/adapter-expo @livestore/react @livestore/peer-deps expo-sqlite
+```
+
+```bash yarn
+yarn add @livestore/livestore @livestore/adapter-expo @livestore/react @livestore/peer-deps expo-sqlite
+```
+
+```bash bun
+bun add @livestore/livestore @livestore/adapter-expo @livestore/react @livestore/peer-deps expo-sqlite
+```
+
+</CodeGroup>
+
+<Note>
+  When using pnpm, add `node-linker=hoisted` to your `.npmrc` file. Expo does
+  not yet support non-hoisted installs.
+</Note>
+
+Optionally install the Expo devtools integration:
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/devtools-expo
+```
+
+```bash pnpm
+pnpm add @livestore/devtools-expo
+```
+
+```bash yarn
+yarn add @livestore/devtools-expo
+```
+
+```bash bun
+bun add @livestore/devtools-expo
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Configure Babel and Metro">
+
+LiveStore Devtools uses Vite internally. Add `babel-plugin-transform-vite-meta-env` to emulate `import.meta.env` in the Metro bundler:
+
+<CodeGroup>
+
+```bash npm
+npm install --save-dev babel-plugin-transform-vite-meta-env
+```
+
+```bash pnpm
+pnpm add -D babel-plugin-transform-vite-meta-env
+```
+
+```bash yarn
+yarn add -D babel-plugin-transform-vite-meta-env
+```
+
+```bash bun
+bun add -d babel-plugin-transform-vite-meta-env
+```
+
+</CodeGroup>
+
+Update your Babel config:
+
+```javascript babel.config.js
+module.exports = (api) => {
+  api.cache(true)
+  return {
+    presets: [['babel-preset-expo', { unstable_transformImportMeta: true }]],
+    plugins: ['babel-plugin-transform-vite-meta-env', '@babel/plugin-syntax-import-attributes'],
+  }
+}
+```
+
+Update your Metro config to add the LiveStore devtools middleware:
+
+```javascript metro.config.js
+const { getDefaultConfig } = require('expo/metro-config')
+const { addLiveStoreDevtoolsMiddleware } = require('@livestore/devtools-expo')
+
+const config = getDefaultConfig(__dirname)
+
+addLiveStoreDevtoolsMiddleware(config, {
+  schemaPath: './src/livestore/schema.ts',
+})
+
+module.exports = config
+```
+
+<Note>
+  Skip the Babel and Metro changes if you are not using the Expo devtools
+  integration.
+</Note>
+
+</Step>
+
+<Step title="Define your schema">
+
+Create `src/livestore/schema.ts`. The schema declares your events, SQLite tables, and materializers.
+
+```typescript src/livestore/schema.ts
+import { Events, makeSchema, Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+// SQLite tables hold derived state
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+      deletedAt: State.SQLite.integer({ nullable: true, schema: Schema.DateFromNumber }),
+    },
+  }),
+  // Client documents store local-only state (e.g. form input)
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({
+      newTodoText: Schema.String,
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+    default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+  }),
+}
+
+// Events describe all data changes
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoUncompleted: Events.synced({
+    name: 'v1.TodoUncompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Date }),
+  }),
+  uiStateSet: tables.uiState.set,
+}
+
+// Materializers map events onto table mutations
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+  'v1.TodoUncompleted': ({ id }) => tables.todos.update({ completed: false }).where({ id }),
+  'v1.TodoDeleted': ({ id, deletedAt }) => tables.todos.update({ deletedAt }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+
+export const schema = makeSchema({ events, state })
+```
+
+</Step>
+
+<Step title="Configure the store">
+
+Create `src/livestore/store.ts`. This file creates the Expo adapter and exports a `useAppStore` hook.
+
+```typescript src/livestore/store.ts
+import { unstable_batchedUpdates as batchUpdates } from 'react-native'
+
+import { makePersistedAdapter } from '@livestore/adapter-expo'
+import { useStore } from '@livestore/react'
+
+import { events, schema, tables } from './schema.ts'
+
+const adapter = makePersistedAdapter()
+
+export const useAppStore = () =>
+  useStore({
+    storeId: 'expo-app',
+    schema,
+    adapter,
+    batchUpdates,
+    // Seed initial data on first launch
+    boot: (store) => {
+      if (store.query(tables.todos.count()) === 0) {
+        store.commit(events.todoCreated({ id: crypto.randomUUID(), text: 'Make coffee' }))
+      }
+    },
+  })
+```
+
+The `boot` callback runs once when the store is first created. Use it to seed initial data.
+
+</Step>
+
+<Step title="Set up LiveStoreProvider">
+
+Wrap your app root with `StoreRegistryProvider` inside a `Suspense` boundary:
+
+```tsx src/Root.tsx
+import { type FC, Suspense, useState } from 'react'
+import { SafeAreaView, Text } from 'react-native'
+
+import { StoreRegistry } from '@livestore/livestore'
+import { StoreRegistryProvider } from '@livestore/react'
+
+import { AppContent } from './AppContent.tsx'
+
+const suspenseFallback = <Text>Loading LiveStore...</Text>
+
+export const Root: FC = () => {
+  const [storeRegistry] = useState(() => new StoreRegistry())
+
+  return (
+    <SafeAreaView style={{ flex: 1 }}>
+      <Suspense fallback={suspenseFallback}>
+        <StoreRegistryProvider storeRegistry={storeRegistry}>
+          <AppContent />
+        </StoreRegistryProvider>
+      </Suspense>
+    </SafeAreaView>
+  )
+}
+```
+
+<Warning>
+  The `StoreRegistryProvider` must be wrapped in a `Suspense` boundary.
+  `useStore` suspends while the store is loading.
+</Warning>
+
+</Step>
+
+<Step title="Commit events and query data">
+
+Use `useAppStore()` inside any descendant component to commit events and run reactive queries.
+
+**Committing events:**
+
+```tsx src/components/NewTodo.tsx
+import { type FC, useCallback } from 'react'
+import { Button, TextInput, View } from 'react-native'
+
+import { events, tables } from '../livestore/schema.ts'
+import { useAppStore } from '../livestore/store.ts'
+import { queryDb } from '@livestore/livestore'
+
+const uiState$ = queryDb(tables.uiState.get(), { label: 'uiState' })
+
+export const NewTodo: FC = () => {
+  const store = useAppStore()
+  const { newTodoText } = store.useQuery(uiState$)
+
+  const updateText = useCallback(
+    (text: string) => store.commit(events.uiStateSet({ newTodoText: text })),
+    [store],
+  )
+
+  const createTodo = useCallback(() => {
+    store.commit(
+      events.todoCreated({ id: crypto.randomUUID(), text: newTodoText }),
+      events.uiStateSet({ newTodoText: '' }),
+    )
+  }, [newTodoText, store])
+
+  return (
+    <View style={{ gap: 12 }}>
+      <TextInput
+        value={newTodoText}
+        onChangeText={updateText}
+        placeholder="What needs to be done?"
+      />
+      <Button title="Add todo" onPress={createTodo} />
+    </View>
+  )
+}
+```
+
+**Querying data:**
+
+```tsx src/components/TodoList.tsx
+import { type FC, useCallback } from 'react'
+import { Button, ScrollView, Text, View } from 'react-native'
+
+import { queryDb } from '@livestore/livestore'
+
+import { events, tables } from '../livestore/schema.ts'
+import { useAppStore } from '../livestore/store.ts'
+
+const todos$ = queryDb(
+  () => tables.todos.where({ deletedAt: null }),
+  { label: 'todos' },
+)
+
+export const TodoList: FC = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(todos$)
+
+  const toggleTodo = useCallback(
+    ({ id, completed }: typeof tables.todos.Type) => {
+      store.commit(completed ? events.todoUncompleted({ id }) : events.todoCompleted({ id }))
+    },
+    [store],
+  )
+
+  return (
+    <ScrollView>
+      {todos.map((todo) => (
+        <View key={todo.id} style={{ flexDirection: 'row', gap: 8, padding: 8 }}>
+          <Button
+            title={todo.completed ? 'Undo' : 'Done'}
+            onPress={() => toggleTodo(todo)}
+          />
+          <Text>{todo.text}</Text>
+        </View>
+      ))}
+    </ScrollView>
+  )
+}
+```
+
+</Step>
+
+</Steps>
+
+## Devtools
+
+To open the devtools, start the app and press `shift + m` in the terminal, then select **LiveStore Devtools** and press Enter. This opens the devtools in your browser where you can inspect state, replay events, and monitor performance.
+
+## Database location
+
+The SQLite database is stored in the app's Documents directory.
+
+**With Expo Go** — open the database directory in Finder:
+
+```bash
+open $(find $(xcrun simctl get_app_container booted host.exp.Exponent data) \
+  -path "*/Documents/ExponentExperienceData/*livestore*" -print -quit)/SQLite
+```
+
+**With a development build** — replace `[BUNDLE_ID]` with your app's bundle identifier:
+
+```bash
+open $(xcrun simctl get_app_container booted [BUNDLE_ID] data)/Documents/SQLite
+```
+
+<Tip>
+  See the [expo-todomvc-sync-cf](https://github.com/livestorejs/livestore/tree/main/examples/expo-todomvc-sync-cf)
+  example for a complete app with Cloudflare sync.
+</Tip>

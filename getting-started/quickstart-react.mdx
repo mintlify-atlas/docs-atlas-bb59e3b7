@@ -1,0 +1,368 @@
+---
+title: "Quickstart: React"
+description: "Add LiveStore to a React web app with persisted SQLite state and optional Cloudflare sync."
+---
+
+<Info>
+  LiveStore requires Node.js 18 or higher. Bun 1.2+ or pnpm are recommended for the simplest dependency setup.
+</Info>
+
+<Steps>
+
+<Step title="Install packages">
+
+Install the core LiveStore packages along with the web adapter and React bindings.
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/react @livestore/peer-deps
+```
+
+```bash pnpm
+pnpm add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/react @livestore/peer-deps
+```
+
+```bash yarn
+yarn add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/react @livestore/peer-deps
+```
+
+```bash bun
+bun add @livestore/livestore @livestore/wa-sqlite @livestore/adapter-web @livestore/react @livestore/peer-deps
+```
+
+</CodeGroup>
+
+Also install the Vite devtools plugin (optional but recommended):
+
+<CodeGroup>
+
+```bash npm
+npm install --save-dev @livestore/devtools-vite
+```
+
+```bash pnpm
+pnpm add -D @livestore/devtools-vite
+```
+
+```bash yarn
+yarn add -D @livestore/devtools-vite
+```
+
+```bash bun
+bun add -d @livestore/devtools-vite
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Configure Vite">
+
+Update your `vite.config.ts` to set the worker format and add the LiveStore devtools plugin:
+
+```typescript vite.config.ts
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
+import { livestoreDevtoolsPlugin } from '@livestore/devtools-vite'
+
+export default defineConfig({
+  worker: { format: 'es' },
+  plugins: [
+    react(),
+    livestoreDevtoolsPlugin({ schemaPath: './src/livestore/schema.ts' }),
+  ],
+})
+```
+
+<Note>
+  The `worker: { format: 'es' }` setting is required so that Vite bundles the
+  LiveStore web worker as an ES module.
+</Note>
+
+</Step>
+
+<Step title="Create the web worker">
+
+Create `src/livestore.worker.ts`. This file runs in a dedicated worker thread and manages the SQLite database.
+
+```typescript src/livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+
+import { schema } from './livestore/schema.ts'
+
+makeWorker({ schema })
+```
+
+When you import this file from your store setup, append `?worker` to the import path so Vite treats it as a worker module.
+
+</Step>
+
+<Step title="Define your schema">
+
+Create `src/livestore/schema.ts`. The schema declares your events (how data changes), SQLite tables (derived state), and materializers (how events produce state).
+
+```typescript src/livestore/schema.ts
+import { Events, makeSchema, Schema, SessionIdSymbol, State } from '@livestore/livestore'
+
+// SQLite tables hold derived state
+export const tables = {
+  todos: State.SQLite.table({
+    name: 'todos',
+    columns: {
+      id: State.SQLite.text({ primaryKey: true }),
+      text: State.SQLite.text({ default: '' }),
+      completed: State.SQLite.boolean({ default: false }),
+      deletedAt: State.SQLite.integer({ nullable: true, schema: Schema.DateFromNumber }),
+    },
+  }),
+  // Client documents store local-only state (e.g. form input)
+  uiState: State.SQLite.clientDocument({
+    name: 'uiState',
+    schema: Schema.Struct({
+      newTodoText: Schema.String,
+      filter: Schema.Literal('all', 'active', 'completed'),
+    }),
+    default: { id: SessionIdSymbol, value: { newTodoText: '', filter: 'all' } },
+  }),
+}
+
+// Events describe all data changes
+export const events = {
+  todoCreated: Events.synced({
+    name: 'v1.TodoCreated',
+    schema: Schema.Struct({ id: Schema.String, text: Schema.String }),
+  }),
+  todoCompleted: Events.synced({
+    name: 'v1.TodoCompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoUncompleted: Events.synced({
+    name: 'v1.TodoUncompleted',
+    schema: Schema.Struct({ id: Schema.String }),
+  }),
+  todoDeleted: Events.synced({
+    name: 'v1.TodoDeleted',
+    schema: Schema.Struct({ id: Schema.String, deletedAt: Schema.Date }),
+  }),
+  uiStateSet: tables.uiState.set,
+}
+
+// Materializers map events onto table mutations
+const materializers = State.SQLite.materializers(events, {
+  'v1.TodoCreated': ({ id, text }) => tables.todos.insert({ id, text, completed: false }),
+  'v1.TodoCompleted': ({ id }) => tables.todos.update({ completed: true }).where({ id }),
+  'v1.TodoUncompleted': ({ id }) => tables.todos.update({ completed: false }).where({ id }),
+  'v1.TodoDeleted': ({ id, deletedAt }) => tables.todos.update({ deletedAt }).where({ id }),
+})
+
+const state = State.SQLite.makeState({ tables, materializers })
+
+export const schema = makeSchema({ events, state })
+```
+
+</Step>
+
+<Step title="Configure the store">
+
+Create `src/store.ts`. This file creates the persisted adapter and exports a `useAppStore` hook that components use to access the store.
+
+```typescript src/store.ts
+import { unstable_batchedUpdates as batchUpdates } from 'react-dom'
+
+import { makePersistedAdapter } from '@livestore/adapter-web'
+import LiveStoreSharedWorker from '@livestore/adapter-web/shared-worker?sharedworker'
+import { useStore } from '@livestore/react'
+
+import LiveStoreWorker from './livestore.worker.ts?worker'
+import { schema } from './livestore/schema.ts'
+
+const adapter = makePersistedAdapter({
+  storage: { type: 'opfs' },
+  worker: LiveStoreWorker,
+  sharedWorker: LiveStoreSharedWorker,
+})
+
+export const useAppStore = () =>
+  useStore({
+    storeId: 'app-root',
+    schema,
+    adapter,
+    batchUpdates,
+  })
+```
+
+The `?worker` and `?sharedworker` suffixes tell Vite to bundle these imports as worker modules. `makePersistedAdapter` uses the Origin Private File System (OPFS) for persistent storage and automatically falls back to in-memory storage in environments where OPFS is unavailable (such as private browsing mode).
+
+</Step>
+
+<Step title="Set up LiveStoreProvider">
+
+Wrap your app root with `StoreRegistryProvider` inside a `Suspense` boundary. The registry manages store lifecycles across your component tree.
+
+```tsx src/App.tsx
+import type React from 'react'
+import { Suspense, useState } from 'react'
+
+import { StoreRegistry } from '@livestore/livestore'
+import { StoreRegistryProvider } from '@livestore/react'
+
+const suspenseFallback = <div>Loading...</div>
+
+export const App: React.FC = () => {
+  const [storeRegistry] = useState(() => new StoreRegistry())
+
+  return (
+    <Suspense fallback={suspenseFallback}>
+      <StoreRegistryProvider storeRegistry={storeRegistry}>
+        {/* Your app components go here */}
+      </StoreRegistryProvider>
+    </Suspense>
+  )
+}
+```
+
+<Warning>
+  The `StoreRegistryProvider` must be wrapped in a `Suspense` boundary.
+  `useStore` suspends while the store is loading, so without a boundary React
+  will throw an error.
+</Warning>
+
+</Step>
+
+<Step title="Commit events and query data">
+
+Use `useAppStore()` inside any component that is a descendant of `StoreRegistryProvider` to commit events and run reactive queries.
+
+**Committing events** — call `store.commit()` with one or more events:
+
+```tsx src/components/AddTodo.tsx
+import type React from 'react'
+import { useCallback } from 'react'
+
+import { queryDb } from '@livestore/livestore'
+
+import { events, tables } from '../livestore/schema.ts'
+import { useAppStore } from '../store.ts'
+
+const uiState$ = queryDb(tables.uiState.get(), { label: 'uiState' })
+
+export const AddTodo: React.FC = () => {
+  const store = useAppStore()
+  const { newTodoText } = store.useQuery(uiState$)
+
+  const updateText = useCallback(
+    (text: string) => store.commit(events.uiStateSet({ newTodoText: text })),
+    [store],
+  )
+
+  const createTodo = useCallback(() => {
+    store.commit(
+      events.todoCreated({ id: crypto.randomUUID(), text: newTodoText }),
+      events.uiStateSet({ newTodoText: '' }),
+    )
+  }, [newTodoText, store])
+
+  return (
+    <input
+      value={newTodoText}
+      placeholder="What needs to be done?"
+      onChange={(e) => updateText(e.target.value)}
+      onKeyDown={(e) => e.key === 'Enter' && createTodo()}
+    />
+  )
+}
+```
+
+**Querying data** — define a query with `queryDb` and execute it with `store.useQuery()`. Queries are reactive: the component re-renders whenever the underlying data changes.
+
+```tsx src/components/TodoList.tsx
+import React from 'react'
+
+import { queryDb } from '@livestore/livestore'
+
+import { events, tables } from '../livestore/schema.ts'
+import { useAppStore } from '../store.ts'
+
+const todos$ = queryDb(
+  () => tables.todos.where({ deletedAt: null }),
+  { label: 'todos' },
+)
+
+export const TodoList: React.FC = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(todos$)
+
+  return (
+    <ul>
+      {todos.map((todo) => (
+        <li key={todo.id}>
+          <input
+            type="checkbox"
+            checked={todo.completed}
+            onChange={() =>
+              store.commit(
+                todo.completed
+                  ? events.todoUncompleted({ id: todo.id })
+                  : events.todoCompleted({ id: todo.id }),
+              )
+            }
+          />
+          {todo.text}
+        </li>
+      ))}
+    </ul>
+  )
+}
+```
+
+</Step>
+
+</Steps>
+
+## Add sync with Cloudflare (optional)
+
+To enable real-time sync across tabs and devices, install the sync package and update your worker:
+
+<CodeGroup>
+
+```bash npm
+npm install @livestore/sync-cf
+```
+
+```bash pnpm
+pnpm add @livestore/sync-cf
+```
+
+```bash yarn
+yarn add @livestore/sync-cf
+```
+
+```bash bun
+bun add @livestore/sync-cf
+```
+
+</CodeGroup>
+
+Update `src/livestore.worker.ts` to wire in the sync backend:
+
+```typescript src/livestore.worker.ts
+import { makeWorker } from '@livestore/adapter-web/worker'
+import { makeWsSync } from '@livestore/sync-cf/client'
+
+import { schema } from './livestore/schema.ts'
+
+makeWorker({
+  schema,
+  sync: {
+    backend: makeWsSync({ url: `${globalThis.location.origin}/sync` }),
+    initialSyncOptions: { _tag: 'Blocking', timeout: 5000 },
+  },
+})
+```
+
+<Tip>
+  See the [web-todomvc-sync-cf](https://github.com/livestorejs/livestore/tree/main/examples/web-todomvc-sync-cf)
+  example for a complete working app with Cloudflare sync, including the
+  Cloudflare Worker backend and `wrangler.toml` configuration.
+</Tip>

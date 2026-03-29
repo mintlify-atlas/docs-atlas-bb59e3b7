@@ -1,0 +1,201 @@
+---
+title: 'Reactivity system'
+description: 'LiveStore has a fine-grained reactivity system built on signals. Learn how to define reactive queries, signals, and computed values.'
+---
+
+LiveStore includes a high-performance, fine-grained reactivity system inspired by [Signals](https://docs.solidjs.com/concepts/signals). Components only re-render when the specific data they read actually changes — not whenever any part of the store updates.
+
+There are three types of reactive state:
+
+| Type | Description |
+|---|---|
+| `queryDb()` | Reactive SQL query over your SQLite tables |
+| `signal()` | Reactive value you control directly |
+| `computed()` | Derived reactive value from other reactive state |
+
+By convention, reactive state variables end with `$` (e.g. `todos$`, `count$`).
+
+## `queryDb()` — reactive SQL queries
+
+`queryDb` creates a reactive query definition tied to a SQLite table or raw SQL. When the underlying data changes, anything subscribed to the query updates automatically.
+
+```typescript
+import { queryDb, signal } from '@livestore/livestore'
+import { tables } from './schema.ts'
+
+// Simple query
+const todos$ = queryDb(tables.todos.orderBy('createdAt', 'desc'), { label: 'todos$' })
+
+// Query that depends on other reactive state
+const uiState$ = signal({ showCompleted: false }, { label: 'uiState$' })
+
+const filteredTodos$ = queryDb(
+  (get) => {
+    const { showCompleted } = get(uiState$)
+    return tables.todos.where(showCompleted === true ? { completed: true } : {})
+  },
+  { label: 'filteredTodos$' },
+)
+```
+
+### Raw SQL queries
+
+Pass a raw SQL object with an explicit result schema for queries the query builder can't express:
+
+```typescript
+import { queryDb, Schema, State, sql } from '@livestore/livestore'
+
+const table = State.SQLite.table({
+  name: 'my_table',
+  columns: {
+    id: State.SQLite.text({ primaryKey: true }),
+    name: State.SQLite.text(),
+  },
+})
+
+const filtered$ = queryDb({
+  query: sql`select * from my_table where name = 'Alice'`,
+  schema: Schema.Array(table.rowSchema),
+})
+
+const count$ = queryDb({
+  query: sql`select count(*) as count from my_table`,
+  schema: Schema.Struct({ count: Schema.Number }).pipe(Schema.pluck('count'), Schema.Array, Schema.headOrElse()),
+})
+```
+
+### Reacting to component props with `deps`
+
+When your query depends on a value passed in from outside (e.g. a component prop), use the `deps` array. LiveStore recreates the query definition when a dep changes.
+
+```typescript
+import type { FC } from 'react'
+import { queryDb } from '@livestore/livestore'
+import { tables } from './schema.ts'
+import { useAppStore } from './store.ts'
+
+export const todos$ = ({ showCompleted }: { showCompleted: boolean }) =>
+  queryDb(
+    () => tables.todos.where(showCompleted === true ? { completed: true } : {}),
+    {
+      label: 'todos$',
+      deps: [showCompleted === true ? 'true' : 'false'],
+    },
+  )
+
+export const MyComponent: FC<{ showCompleted: boolean }> = ({ showCompleted }) => {
+  const store = useAppStore()
+  const todos = store.useQuery(todos$({ showCompleted }))
+
+  return <div>{todos.length} done</div>
+}
+```
+
+## `signal()` — reactive state values
+
+Signals hold arbitrary reactive values that you set and read manually. Use them for state that is not materialized from events, such as UI focus state, timers, or selections.
+
+```typescript
+import { type Store, signal } from '@livestore/livestore'
+
+declare const store: Store
+
+const now$ = signal(Date.now(), { label: 'now$' })
+
+setInterval(() => {
+  store.setSignal(now$, Date.now())
+}, 1000)
+
+const num$ = signal(0, { label: 'num$' })
+const increment = () => store.setSignal(num$, (prev) => prev + 1)
+
+increment()
+increment()
+
+console.log(store.query(num$)) // 2
+```
+
+## `computed()` — derived reactive values
+
+`computed` derives a value from one or more reactive dependencies. It recalculates only when its dependencies change.
+
+```typescript
+import { computed, signal } from '@livestore/livestore'
+
+const num$ = signal(0, { label: 'num$' })
+const duplicated$ = computed((get) => get(num$) * 2, { label: 'duplicated$' })
+```
+
+## Accessing reactive state imperatively
+
+Reactive state is always bound to a `Store` instance. You can read values outside of a framework component using `store.query()` and `store.subscribe()`.
+
+```typescript
+import { queryDb, type Store } from '@livestore/livestore'
+import { type schema, tables } from './schema.ts'
+
+declare const store: Store<typeof schema>
+
+const count$ = queryDb(tables.todos.count(), { label: 'count$' })
+
+// Read once
+const count = store.query(count$)
+console.log(count)
+
+// Subscribe to changes
+const unsubscribe = store.subscribe(count$, (value) => {
+  console.log(value)
+})
+
+// Stop listening
+unsubscribe()
+```
+
+## Framework integrations
+
+### React
+
+Use `store.useQuery()` inside a component. The component re-renders only when the query result changes.
+
+```tsx
+import type { FC } from 'react'
+import { queryDb } from '@livestore/livestore'
+import { tables } from './schema.ts'
+import { useAppStore } from './store.ts'
+
+const todos$ = queryDb(tables.todos.orderBy('createdAt', 'desc'), { label: 'todos' })
+
+export const TodoList: FC = () => {
+  const store = useAppStore()
+  const todos = store.useQuery(todos$)
+
+  return <div>{todos.length} items</div>
+}
+```
+
+### Solid
+
+In Solid, `store.useQuery()` returns an accessor function (a signal):
+
+```tsx
+import type { LiveQueryDef, Store } from '@livestore/livestore'
+
+declare const store: Store & { useQuery: <T>(query: LiveQueryDef<T>) => () => T }
+declare const state$: LiveQueryDef<number>
+
+export const MyComponent = () => {
+  const value = store.useQuery(state$)
+
+  return <div>{value()}</div>
+}
+```
+
+## Performance
+
+LiveStore's reactivity is **fine-grained**: only the components or subscriptions that depend on a specific piece of data are notified when that data changes. A component subscribing to `todos$` does not re-render when `uiState$` changes, and vice versa.
+
+This is especially important for large lists and complex UIs where naive solutions re-render the whole tree on every store update.
+
+<Tip>
+  Use the `label` option on all reactive state definitions. Labels appear in the LiveStore devtools, making it much easier to trace which queries are active and what is causing re-renders.
+</Tip>

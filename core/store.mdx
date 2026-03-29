@@ -1,0 +1,316 @@
+---
+title: 'Store'
+description: 'The Store is the main entry point for LiveStore. Learn how to create, query, commit, subscribe, and shut down a store.'
+---
+
+The `Store` is the main object you interact with in your application. It lets you:
+
+- Query materialized state
+- Commit events
+- Subscribe to data changes
+- Monitor sync status
+- Shut down cleanly
+
+## Creating a store
+
+<Tabs>
+  <Tab title="Promise-based">
+    ```typescript
+    import { makeAdapter } from '@livestore/adapter-node'
+    import { createStorePromise } from '@livestore/livestore'
+    import { schema } from './schema.ts'
+
+    const adapter = makeAdapter({
+      storage: { type: 'fs' },
+      // sync: { backend: makeWsSync({ url: '...' }) },
+    })
+
+    export const bootstrap = async () => {
+      const store = await createStorePromise({
+        schema,
+        adapter,
+        storeId: 'some-store-id',
+      })
+
+      return store
+    }
+    ```
+  </Tab>
+  <Tab title="React">
+    See the [React integration docs](/integrations/react) for how to provide a store to your component tree.
+  </Tab>
+</Tabs>
+
+The `storeId` identifies the store locally and is used to match data when syncing. Use a meaningful identifier such as a workspace ID or user ID.
+
+## Querying data
+
+`store.query()` returns the current value of a query synchronously:
+
+```typescript
+import type { Store } from '@livestore/livestore'
+import { storeTables } from './schema.ts'
+
+declare const store: Store
+
+const todos = store.query(storeTables.todos)
+console.log(todos)
+```
+
+You can pass any query definition: a table, a filtered query, a `queryDb()`, a `signal()`, or a `computed()`.
+
+## Committing events
+
+```typescript
+import type { Store } from '@livestore/livestore'
+import { storeEvents } from './schema.ts'
+
+declare const store: Store
+
+store.commit(storeEvents.todoCreated({ id: '1', text: 'Buy milk' }))
+```
+
+`store.commit()` is synchronous. The event is immediately applied to local state, then synced to the backend in the background.
+
+## Subscribing to data
+
+`store.subscribe()` calls your callback whenever the query result changes. It returns an unsubscribe function.
+
+```typescript
+import type { Store } from '@livestore/livestore'
+import { storeTables } from './schema.ts'
+
+declare const store: Store
+
+const unsubscribe = store.subscribe(storeTables.todos, (todos) => {
+  console.log(todos)
+})
+
+// Stop listening
+unsubscribe()
+```
+
+## Streaming events
+
+Iterate over events confirmed by the sync backend using `store.events()`:
+
+```typescript
+import type { Store } from '@livestore/livestore'
+
+declare const store: Store
+
+// Iterate once
+for await (const event of store.events()) {
+  console.log('event from leader', event)
+}
+
+// Continuous stream
+const iterator = store.events()[Symbol.asyncIterator]()
+try {
+  while (true) {
+    const { value, done } = await iterator.next()
+    if (done === true) break
+    console.log('event from stream:', value)
+  }
+} finally {
+  await iterator.return?.()
+}
+```
+
+<Note>
+  Only events confirmed by the sync backend are streamed. Pending local events are not included.
+</Note>
+
+## Sync status
+
+Monitor the synchronization state between the local session and the leader thread.
+
+```typescript
+type SyncStatus = {
+  localHead: string      // e.g. "e5.2" or "e5.2r1"
+  upstreamHead: string   // e.g. "e3"
+  pendingCount: number   // number of events pending sync
+  isSynced: boolean      // true when pendingCount === 0
+}
+```
+
+<Tabs>
+  <Tab title="Synchronous read">
+    ```typescript
+    const status = store.syncStatus()
+    if (!status.isSynced) {
+      console.log(`${status.pendingCount} events pending sync`)
+    }
+    ```
+  </Tab>
+  <Tab title="Subscribe to changes">
+    ```typescript
+    const unsubscribe = store.subscribeSyncStatus((status) => {
+      updateUI(status.isSynced ? 'Synced' : 'Syncing...')
+    })
+
+    // Stop listening
+    unsubscribe()
+    ```
+  </Tab>
+  <Tab title="Effect stream">
+    ```typescript
+    import { Effect, Stream } from 'effect'
+
+    store.syncStatusStream().pipe(
+      Stream.tap((status) => Effect.log(`Sync: ${status.isSynced}`)),
+      Stream.runDrain,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Shutting down a store
+
+```typescript
+import { Effect } from 'effect'
+import type { Store } from '@livestore/livestore'
+
+declare const store: Store
+
+// Effect-based
+const effectShutdown = Effect.gen(function* () {
+  yield* Effect.log('Shutting down store')
+  yield* store.shutdown()
+})
+
+// Promise-based
+const shutdownWithPromise = async () => {
+  await store.shutdownPromise()
+}
+```
+
+## Effect integration
+
+For applications using [Effect](https://effect.website), LiveStore provides type-safe store access through the Effect layer system.
+
+### Creating a typed store context
+
+```typescript
+import { makeAdapter } from '@livestore/adapter-node'
+import { Store } from '@livestore/livestore/effect'
+import { schema } from './schema.ts'
+
+// Define a typed store context with your schema
+export const TodoStore = Store.Tag(schema, 'todos')
+
+// Create a layer to initialize the store
+const adapter = makeAdapter({ storage: { type: 'fs' } })
+
+export const TodoStoreLayer = TodoStore.layer({
+  adapter,
+  batchUpdates: (cb) => cb(), // For Node.js; use React's unstable_batchedUpdates in React apps
+})
+```
+
+### Using the store in Effect services
+
+```typescript
+import { Effect } from 'effect'
+import { TodoStore } from './make-store-context.ts'
+import { storeEvents, storeTables } from './schema.ts'
+
+// Access the store with full type safety
+const todoService = Effect.gen(function* () {
+  const { store } = yield* TodoStore
+
+  const todos = store.query(storeTables.todos.select())
+  store.commit(storeEvents.todoCreated({ id: '1', text: 'Buy milk' }))
+
+  return todos
+})
+
+// Or use static accessors for a functional style
+const todoServiceAlt = Effect.gen(function* () {
+  const todos = yield* TodoStore.query(storeTables.todos.select())
+  yield* TodoStore.commit(storeEvents.todoCreated({ id: '1', text: 'Buy milk' }))
+
+  return todos
+})
+```
+
+### Layer composition
+
+```typescript
+import { Effect, Layer } from 'effect'
+import { TodoStore, TodoStoreLayer } from './make-store-context.ts'
+import { storeEvents } from './schema.ts'
+
+class TodoService extends Effect.Service<TodoService>()('TodoService', {
+  effect: Effect.gen(function* () {
+    const { store } = yield* TodoStore
+
+    const createTodo = (id: string, text: string) =>
+      Effect.sync(() => store.commit(storeEvents.todoCreated({ id, text })))
+
+    return { createTodo } as const
+  }),
+  dependencies: [TodoStoreLayer],
+}) {}
+
+const MainLayer = Layer.mergeAll(TodoStoreLayer, TodoService.Default)
+
+const program = Effect.gen(function* () {
+  const todoService = yield* TodoService
+  yield* todoService.createTodo('1', 'Learn Effect')
+})
+
+void program.pipe(Effect.provide(MainLayer))
+```
+
+### Multiple stores with Effect
+
+Each store gets a unique context tag, so multiple stores coexist in the same Effect context:
+
+```typescript
+import { Effect, Layer } from 'effect'
+import { makeAdapter } from '@livestore/adapter-node'
+import { Store } from '@livestore/livestore/effect'
+import { schema as mainSchema } from './schema.ts'
+
+const settingsSchema = mainSchema
+
+const MainStore = Store.Tag(mainSchema, 'main')
+const SettingsStore = Store.Tag(settingsSchema, 'settings')
+
+const adapter = makeAdapter({ storage: { type: 'fs' } })
+
+const MainStoreLayer = MainStore.layer({ adapter, batchUpdates: (cb) => cb() })
+const SettingsStoreLayer = SettingsStore.layer({ adapter, batchUpdates: (cb) => cb() })
+
+const AllStoresLayer = Layer.mergeAll(MainStoreLayer, SettingsStoreLayer)
+
+const program = Effect.gen(function* () {
+  const { store: mainStore } = yield* MainStore
+  const { store: settingsStore } = yield* SettingsStore
+
+  return { mainStore, settingsStore }
+})
+```
+
+## Multiple stores
+
+You can instantiate multiple stores in the same app. This is useful for splitting a large data model into independent domains, or for loading per-workspace or per-document stores independently.
+
+## Development helpers
+
+A store instance exposes `_dev` for debugging. In a browser, you can access the default store globally:
+
+```typescript
+// Download the SQLite database
+__debugLiveStore.default._dev.downloadDb()
+
+// Download the eventlog database
+__debugLiveStore.default._dev.downloadEventlogDb()
+
+// Reset the store
+__debugLiveStore.default._dev.hardReset()
+
+// Inspect the current sync state
+__debugLiveStore.default._dev.syncStates()
+```
